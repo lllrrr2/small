@@ -25,11 +25,11 @@ jobs:
           fetch-depth: 0
 
       - name: Build
-        uses: kenzok8/gh-action-sdk@main
+        uses: kenzok8/gh-action-sdk@hash
         env:
           ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
           FEEDNAME: packages_ci
-          PACKAGES: luci-app-passwall luci-app-passwall2 luci-app-ssr-plus luci-app-bypass brook hysteria ipt2socks pdnsd-alt redsocks2 shadow-tls trojan tuic-client xray-plugin v2ray-core v2ray-geodata naiveproxy
+          PACKAGES: luci-app-passwall luci-app-passwall2 luci-app-ssr-plus luci-app-bypass brook hysteria ipt2socks pdnsd-alt redsocks2 shadow-tls trojan tuic-client xray-plugin v2ray-core v2ray-geodata naiveproxy sing-box
           NO_REFRESH_CHECK: true
           IGNORE_ERRORS: true
 
@@ -62,7 +62,7 @@ jobs:
         uses: Mattraks/delete-workflow-runs@main
         with:
           retain_days: 10
-          keep_minimum_runs: 0
+          keep_minimum_runs: 2
     
       - name: Remove old Releases
         uses: dev-drprasad/delete-older-releases@master
