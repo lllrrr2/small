@@ -1,7 +1,8 @@
+engage.cloudflareclient.com
+github.com
 bing.com
-sspanel.net
-v2ex.com
 c.mi.com
+apple-relay.apple.com
 
 #google
 googleapis.cn
@@ -11,7 +12,16 @@ google.com.hk
 gstatic.com
 xn--ngstr-lra8j.com
 
-#github
-github.com
-github.global.ssl.fastly.net
-assets-cdn.github.com
+#DNS-Leak
+dnsleaktest.com
+dnsleak.com
+expressvpn.com
+nordvpn.com
+surfshark.com
+ipleak.net
+perfect-privacy.com
+browserleaks.com
+browserleaks.org
+vpnunlimited.com
+whoer.net
+whrq.net

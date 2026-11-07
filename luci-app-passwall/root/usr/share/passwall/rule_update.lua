@@ -1,39 +1,74 @@
 #!/usr/bin/lua
 
-require 'nixio'
-require 'luci.sys'
-local luci = luci
-local ucic = luci.model.uci.cursor()
-local jsonc = require "luci.jsonc"
-local name = 'passwall'
 local api = require ("luci.passwall.api")
+local appname = api.appname
+local sys = api.sys
+local jsonc = api.jsonc
+local fs = api.fs
+local uci, uci_get, uci_set, uci_del, uci_foreach, uci_save = api.uci, api.uci_get_c, api.uci_set_c, api.uci_del_c, api.uci_foreach_c, api.uci_save_c
+
+-- [[ 逻辑锁 Start ]] --
+-- Both update scripts use the same lockf lock; the kernel releases it on exit.
+local update_lock = api.nixio.open(api.LOCK_PREFIX .. "_sub_rule.lock", api.nixio.open_flags("rdwr", "creat"))
+if not update_lock then
+	api.log("无法打开订阅/规则更新锁，退出。")
+	os.exit(1)
+end
+-- Scheduled updates wait for the lock; manual requests may skip a busy lock.
+if not update_lock:lock("tlock") then
+	if arg[3] ~= "cron" then
+		api.log("订阅或规则更新正在运行，本次请求跳过。")
+		os.exit(0)
+	end
+	local running = ({s = "订阅", r = "规则更新"})[update_lock:read(1)] or "订阅/规则更新"
+	update_lock:seek(0)
+	api.log("[" .. running .. "]实例正在运行，[规则更新]进入队列等待...")
+	if not update_lock:lock("lock") then
+		api.log("无法取得更新锁，计划任务失败。")
+		os.exit(1)
+	end
+end
+-- Record the running task in the same file: s = subscription, r = rule update.
+update_lock:write("r")
+update_lock:seek(0)
+api.uci:revert(api.c_config)
+math.randomseed(os.time() + math.floor(os.clock() * 1000))
+-- [[ 逻辑锁 End ]] --
+
 local arg1 = arg[1]
+local arg2 = arg[2]
+local arg3 = arg[3]
 
-local rule_path = "/usr/share/" .. name .. "/rules"
+local nftable_name = "inet passwall"
+local rule_path = "/usr/share/passwall/rules"
 local reboot = 0
-local gfwlist_update = 0
-local chnroute_update = 0
-local chnroute6_update = 0
-local chnlist_update = 0
-local geoip_update = 0
-local geosite_update = 0
+local gfwlist_update = "0"
+local chnroute_update = "0"
+local chnroute6_update = "0"
+local chnlist_update = "0"
+local geoip_update = "0"
+local geosite_update = "0"
 
--- match comments/title/whitelist/ip address/excluded_domain
-local comment_pattern = "^[!\\[@]+"
-local ip_pattern = "^%d+%.%d+%.%d+%.%d+"
-local ip4_ipset_pattern = "^%d+%.%d+%.%d+%.%d+[%/][%d]+$"
-local ip6_ipset_pattern = ":-[%x]+%:+[%x]-[%/][%d]+$"
-local domain_pattern = "([%w%-%_]+%.[%w%.%-%_]+)[%/%*]*"
 local excluded_domain = {"apple.com","sina.cn","sina.com.cn","baidu.com","byr.cn","jlike.com","weibo.com","zhongsou.com","youdao.com","sogou.com","so.com","soso.com","aliyun.com","taobao.com","jd.com","qq.com","bing.com"}
 
-local gfwlist_url = ucic:get(name, "@global_rules[0]", "gfwlist_url") or {"https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt"}
-local chnroute_url = ucic:get(name, "@global_rules[0]", "chnroute_url") or {"https://ispip.clang.cn/all_cn.txt"}
-local chnroute6_url =  ucic:get(name, "@global_rules[0]", "chnroute6_url") or {"https://ispip.clang.cn/all_cn_ipv6.txt"}
-local chnlist_url = ucic:get(name, "@global_rules[0]", "chnlist_url") or {"https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list/accelerated-domains.china.conf","https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list/apple.china.conf","https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list/google.china.conf"}
-local geoip_api =  "https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest"
-local geosite_api =  "https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest"
-local asset_location = ucic:get_first(name, 'global_rules', "v2ray_location_asset", "/usr/share/v2ray/")
-local use_nft = ucic:get(name, "@global_forwarding[0]", "use_nft") or "0"
+local gfwlist_url = uci_get("@global_rules[0]", "gfwlist_url") or {"https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt"}
+local chnroute_url = uci_get("@global_rules[0]", "chnroute_url") or {"https://ispip.clang.cn/all_cn.txt"}
+local chnroute6_url = uci_get("@global_rules[0]", "chnroute6_url") or {"https://ispip.clang.cn/all_cn_ipv6.txt"}
+local chnlist_url = uci_get("@global_rules[0]", "chnlist_url") or {"https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list/accelerated-domains.china.conf","https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list/apple.china.conf","https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list/google.china.conf"}
+local geoip_url = uci_get("@global_rules[0]", "geoip_url") or "https://github.com/Loyalsoldier/geoip/releases/latest/download/geoip.dat"
+local geosite_url = uci_get("@global_rules[0]", "geosite_url") or "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+local asset_location = uci_get("@global_rules[0]", "v2ray_location_asset") or "/usr/share/v2ray/"
+local geo2rule = uci_get("@global_rules[0]", "geo2rule") or "0"
+local geoip_update_ok, geosite_update_ok = false, false
+asset_location = asset_location:match("/$") and asset_location or (asset_location .. "/")
+local backup_path = "/tmp/bak_v2ray/"
+local rollback = false
+
+if arg3 == "cron" then
+	arg2 = nil
+elseif arg3 == "rollback" then
+	rollback, geoip_update_ok, geosite_update_ok = true, true, true
+end
 
 local log = function(...)
 	if arg1 then
@@ -46,208 +81,651 @@ local log = function(...)
 	end
 end
 
-local function gen_nftset(set_name, ip_type, tmp_file, input_file)
-	f = io.open(input_file, "r")
-	local element = f:read("*all")
-	f:close()
-
-	nft_file, err = io.open(tmp_file, "w")
-	nft_file:write('#!/usr/sbin/nft -f\n')
-	nft_file:write(string.format('define %s = {%s}\n', set_name, string.gsub(element, "%s*%c+", " timeout 3650d, ")))
-	if luci.sys.call(string.format('nft "list set inet fw4 %s" >/dev/null 2>&1', set_name)) ~= 0 then
-		nft_file:write(string.format('add set inet fw4 %s { type %s; flags interval, timeout; timeout 2d; gc-interval 2d; auto-merge; }\n', set_name, ip_type))
-	end
-	nft_file:write(string.format('add element inet fw4 %s $%s\n', set_name, set_name))
-	nft_file:close()
-	luci.sys.call(string.format('nft -f %s &>/dev/null',tmp_file))
-	os.remove(tmp_file)
-end
-
 --gen cache for nftset from file
 local function gen_cache(set_name, ip_type, input_file, output_file)
-	local tmp_dir = "/tmp/"
-	local tmp_file = output_file .. "_tmp"
-	local tmp_set_name = set_name .. "_tmp"
-	gen_nftset(tmp_set_name, ip_type, tmp_file, input_file)
-	luci.sys.call("nft list set inet fw4 " ..tmp_set_name.. " | sed 's/" ..tmp_set_name.. "/" ..set_name.. "/g' | cat > " ..output_file)
-	luci.sys.call("nft flush set inet fw4 " ..tmp_set_name)
-	luci.sys.call("nft delete set inet fw4 " ..tmp_set_name)
+	local tmp_set_name = set_name .. "_tmp_" .. os.time()
+	local final_set_name = set_name .. "_static"
+	local f_in = io.open(input_file, "r")
+	if not f_in then return false end
+	local nft_pipe = io.popen("nft -f -", "w")
+	if not nft_pipe then
+		f_in:close()
+		return false
+	end
+	nft_pipe:write('#!/usr/sbin/nft -f\n')
+	nft_pipe:write(string.format('add table %s\n', nftable_name))
+	nft_pipe:write(string.format('add set %s %s { type %s; flags interval; auto-merge; }\n', nftable_name, tmp_set_name, ip_type))
+	nft_pipe:write(string.format('add element %s %s { ', nftable_name, tmp_set_name))
+	local count = 0
+	local batch_size = 500
+	for line in f_in:lines() do
+		local ip = line:match("^%s*(.-)%s*$")
+		if ip and ip ~= "" then
+			nft_pipe:write(ip, ", ")
+			count = count + 1
+			if count % batch_size == 0 then
+				nft_pipe:write("}\n")
+				nft_pipe:write(string.format('add element %s %s { ', nftable_name, tmp_set_name))
+			end
+		end
+	end
+	nft_pipe:write("}\n")
+	f_in:close()
+
+	local success = nft_pipe:close()
+	if not (success == true or success == 0) then
+		os.execute(string.format('nft delete set %s %s 2>/dev/null', nftable_name, tmp_set_name))
+		return false
+	end
+	os.execute(string.format('nft list set %s %s | sed "s/%s/%s/g" > %s', nftable_name, tmp_set_name, tmp_set_name, final_set_name, output_file))
+	os.execute(string.format('nft delete set %s %s 2>/dev/null', nftable_name, tmp_set_name))
 end
 
 -- curl
-local function curl(url, file, valifile)
+local function curl(url, file)
+	local http_code = 0
+	local header_str = ""
 	local args = {
-		"-skL", "-w %{http_code}", "--retry 3", "--connect-timeout 3"
+		"-fskL",
+		"--retry 3",
+		"--connect-timeout 3",
+		"--max-time 300",
+		"--speed-limit 51200 --speed-time 15",
+		"-H 'Accept: */*'",
+		'-A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"',
+		"--dump-header -",
+		"-w '\\n%{http_code}'"
 	}
 	if file then
 		args[#args + 1] = "-o " .. file
 	end
-	if valifile then
-		args[#args + 1] = "--dump-header " .. valifile
+	local return_code, result = api.curl_auto(url, nil, args)
+	if result and result ~= "" then
+		local body, code = result:match("^(.-)%s*([0-9]+)$")
+		if code then
+			http_code = tonumber(code) or 0
+			header_str = body
+		else
+			http_code = tonumber(result:match("(%d+)%s*$")) or 0
+		end
 	end
-	local return_code, result = api.curl_logic(url, nil, args)
-	return tonumber(result)
+	if header_str ~= "" then
+		header_str = header_str:gsub("\r", "")
+	end
+	return return_code, http_code, header_str
 end
 
 --check excluded domain
+local excluded_map = {}
+for _, d in ipairs(excluded_domain) do
+	excluded_map[d] = true
+end
 local function check_excluded_domain(value)
-	for k,v in ipairs(excluded_domain) do
-		if value:find(v) then
+	if not value or value == "" then return false end
+	value = value:lower()
+	local eq_pos = value:find("=", 1, true)
+	if eq_pos then
+		value = value:sub(eq_pos + 1)
+	end
+	if value:sub(1,1) == "/" then
+		value = value:sub(2)
+	end
+	local slash_pos = value:find("/", 1, true)
+	local colon_pos = value:find(":", 1, true)
+	local cut_pos
+	if slash_pos and colon_pos then
+		cut_pos = (slash_pos < colon_pos) and slash_pos or colon_pos
+	else
+		cut_pos = slash_pos or colon_pos
+	end
+	if cut_pos then
+		value = value:sub(1, cut_pos - 1)
+	end
+	value = value:gsub("^%.*", ""):gsub("%.*$", "")
+	while value do
+		if excluded_map[value] then
+			return true
+		end
+		local dot_pos = value:find(".", 1, true)
+		if not dot_pos then
+			break
+		end
+		value = value:sub(dot_pos + 1)
+	end
+	return false
+end
+
+-- 替代 string.find 查找 "^[#!\\[@]+"
+local function is_comment_line(s)
+	if not s or s == "" then return false end
+	local b = s:byte(1)
+	-- '#' = 35, '!' = 33, '\' = 92, '[' = 91, '@' = 64
+	if b == 35 or b == 33 or b == 92 or b == 91 or b == 64 then
+		return true
+	end
+	return false
+end
+
+-- IPv4 检测，替代 string.find "^%d+%.%d+%.%d+%.%d+"
+-- IPv4 cidr检测，替代 string.find "^%d+%.%d+%.%d+%.%d+[%/][%d]+$"
+local function is_ipv4(s, check_cidr)
+	local dot = 0
+	local seg_start = 1
+	local len = #s
+	local mask_start = nil
+	local i = 1
+	while i <= len do
+		local b = s:byte(i)
+		if b >= 48 and b <= 57 then
+			-- 数字，继续
+		elseif b == 46 then  -- "."
+			dot = dot + 1
+			if dot > 3 or i == seg_start then return false end
+			local seg = tonumber(s:sub(seg_start, i - 1))
+			if not seg or seg > 255 then return false end
+			seg_start = i + 1
+		elseif b == 47 then  -- "/"
+			if not check_cidr then return false end
+			if dot ~= 3 or i == seg_start then return false end
+			local seg = tonumber(s:sub(seg_start, i - 1))
+			if not seg or seg > 255 then return false end
+			mask_start = i + 1
+			break
+		else
+			return false
+		end
+		i = i + 1
+	end
+	-- 如果没有 CIDR，则检查最后一段即可
+	if not check_cidr or not mask_start then
+		if dot ~= 3 or seg_start > len then return false end
+		local seg = tonumber(s:sub(seg_start))
+		return seg and seg <= 255 or false
+	end
+	-- CIDR 掩码检查
+	if mask_start > len then return false end
+	local mask = tonumber(s:sub(mask_start))
+	return mask and mask >= 0 and mask <= 32 or false
+end
+
+local function is_ipv4_cidr(s)
+	return is_ipv4(s, true)
+end
+
+local function is_ipv6(s, check_cidr)
+	local first = s:byte(1)
+	local last = s:byte(#s)
+	if first == 91 and last == 93 then  -- "[" and "]"
+		s = s:sub(2, -2)
+	end
+	local len = #s
+	local i = 1
+	local seg_len = 0
+	local segs = 0
+	local saw_dc = false  -- 是否出现 "::"
+	local b
+	while i <= len do
+		b = s:byte(i)
+		-- CIDR 部分
+		if b == 47 then  -- '/'
+			if not check_cidr then
+				return false
+			end
+			-- 处理 "/" 之前的段
+			if seg_len > 0 then segs = segs + 1 end
+			if (not saw_dc and segs ~= 8) or (saw_dc and segs > 8) then return false end
+			-- 解析掩码
+			i = i + 1
+			if i > len then return false end
+			local mask = 0
+			while i <= len do
+				b = s:byte(i)
+				if b < 48 or b > 57 then return false end
+				mask = mask * 10 + (b - 48)
+				if mask > 128 then return false end
+				i = i + 1
+			end
+			-- CIDR 解析成功
+			return true
+		end
+		-- 冒号处理（: 或 ::）
+		if b == 58 then
+			local nextb = (i+1 <= len) and s:byte(i+1) or 0
+			-- "::"
+			if nextb == 58 then
+				if saw_dc then return false end
+				saw_dc = true
+				if seg_len > 0 then segs = segs + 1 end
+				seg_len = 0
+				i = i + 2
+			else
+				-- 普通 ":"
+				if seg_len == 0 then return false end
+				segs = segs + 1
+				seg_len = 0
+				i = i + 1
+			end
+		else
+			-- hex 数字
+			local is_hex =
+				(b >= 48 and b <= 57) or   -- 0-9
+				(b >= 65 and b <= 70) or   -- A-F
+				(b >= 97 and b <= 102)     -- a-f
+			if not is_hex then return false end
+			seg_len = seg_len + 1
+			if seg_len > 4 then return false end
+			i = i + 1
+		end
+	end
+	if seg_len > 0 then segs = segs + 1 end
+	if not saw_dc then return segs == 8 end
+	return segs <= 8
+end
+
+-- IPv6 cidr检测，替代 string.find ":-[%x]+%:+[%x]-[%/][%d]+$"
+local function is_ipv6_cidr(s)
+	return is_ipv6(s, true)
+end
+
+-- 检测是否含有冒号，替代 string.find(line, ":")
+local function has_colon(s)
+	for i = 1, #s do
+		if s:byte(i) == 58 then  -- ':'
 			return true
 		end
 	end
+	return false
 end
 
-local function line_count(file_path)
-	local num = 0
-	for _ in io.lines(file_path) do
-		num = num + 1
-	end
-	return num;
-end
-
-local function non_file_check(file_path, vali_file)
-	if nixio.fs.readfile(file_path, 10) then
-		local remote_file_size = tonumber(luci.sys.exec("cat " .. vali_file .. " | grep -i 'Content-Length' | awk '{print $2}'"))
-		local local_file_size = tonumber(nixio.fs.stat(file_path, "size"))
-		if remote_file_size and local_file_size then
-			if remote_file_size == local_file_size then
-				return nil;
-			else
-				log("下载文件大小校验出错，原始文件大小" .. remote_file_size .. "B，下载文件大小：" .. local_file_size .. "B。")
-				return true;
-			end
+-- 域名提取，替代 string.match "([%w%-]+%.[%w%.%-]+)[%/%*]*"
+local function extract_domain(s)
+	if not s or s == "" then return nil end
+	local len = #s
+	local start = nil
+	local last_dot = nil
+	for i = 1, len do
+		local b = s:byte(i)
+		-- 允许的域名字符：a-zA-Z0-9.-
+		if (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 45 or b == 46 then
+			if not start then start = i end
+			if b == 46 then last_dot = i end
 		else
-			return nil;
+			if start then
+				if last_dot and last_dot > start then
+					local domain = s:sub(start, i - 1)
+					while domain:byte(1) == 46 do
+						domain = domain:sub(2)
+					end
+					return domain
+				else
+					start = nil
+					last_dot = nil
+				end
+			end
 		end
-	else
-		log("下载文件读取出错。")
-		return true;
 	end
+	if start and last_dot and last_dot > start then
+		local domain = s:sub(start)
+		while domain:byte(1) == 46 do
+			domain = domain:sub(2)
+		end
+		return domain
+	end
+	return nil
+end
+
+local function non_file_check(file_path, header_content)
+	local remote_file_size = nil
+	local local_file_size = tonumber(fs.stat(file_path, "size") or 0)
+	if local_file_size == 0 then
+		log("下载文件为空或读取出错。")
+		return true
+	end
+	if header_content and header_content ~= "" then
+		for size in header_content:gmatch("[Cc]ontent%-[Ll]ength:%s*(%d+)") do
+			local s = tonumber(size)
+			if s and s > 0 then
+				remote_file_size = s
+			end
+		end
+	end
+	if remote_file_size and remote_file_size ~= local_file_size then
+		log(string.format("校验出错：远程 %dB, 下载 %dB", remote_file_size, local_file_size))
+		return true
+	end
+	return false
+end
+
+-- 检查 Geo 所有分类的边界，每个分类抽查首条规则，仅用于识别 Geo 格式。
+local function validate_geo_file(file_path, geo_type)
+	if geo_type ~= "geoip" and geo_type ~= "geosite" then return false end
+	local file = io.open(file_path, "rb")
+	if not file then return false end
+	local size = file:seek("end")
+	if not size or size == 0 or not file:seek("set", 0) then file:close(); return false end
+	local pos, rules = 0, 0
+	-- 使用文件自身的读取缓冲，跳过内容时直接定位，无需维护额外缓冲区。
+	local function skip(length, limit)
+		assert(length <= limit - pos)
+		pos = pos + length
+		assert(file:seek("set", pos))
+	end
+	-- 未指定数值上限时，仅检查并跳过变长整数，避免 64 位属性值的精度问题。
+	local function varint(limit, maximum)
+		local value, factor = 0, 1
+		for i = 1, 10 do
+			assert(pos < limit)
+			local byte = assert(file:read(1)):byte()
+			pos = pos + 1
+			assert(i < 10 or byte <= 1)
+			if maximum then
+				local digit = byte % 128
+				assert(digit <= math.floor((maximum - value) / factor))
+				value = value + digit * factor
+			end
+			if byte < 128 then return value end
+			factor = factor * 128
+		end
+		error(false)
+	end
+	-- 字段定义：编码类型、子消息类型（可选）、数值上限（可选）。
+	local schema = {
+		list = {{2, geo_type}},
+		geoip = {{2}, {2, "cidr"}, {0}},
+		geosite = {{2}, {2, "domain"}},
+		cidr = {{2}, {0, nil, 4294967295}},
+		domain = {{0, nil, 3}, {2}, {2, "attribute"}},
+		attribute = {{2}, {0}, {0}}
+	}
+	local parse
+	parse = function(kind, limit)
+		local values, entries = {}, 0
+		local is_entry = kind == "geoip" or kind == "geosite"
+		while pos < limit do
+			if is_entry and values[1] and values[1] > 0 and entries > 0 then
+				skip(limit - pos, limit)
+				return
+			end
+			local tag = varint(limit, 4294967295)
+			local field, wire = math.floor(tag / 8), tag % 8
+			local spec = schema[kind][field]
+			assert(field > 0 and (not spec or wire == spec[1]))
+			local value
+			if wire == 0 then
+				value = varint(limit, spec and spec[3])
+			elseif wire == 2 then
+				value = varint(limit, limit - pos)
+				assert(value <= limit - pos)
+				if spec and spec[2] and not (is_entry and entries > 0) then
+					parse(spec[2], pos + value)
+				else
+					skip(value, limit)
+				end
+				if spec and spec[2] then entries = entries + 1 end
+			elseif wire == 1 or wire == 5 then
+				skip(wire == 1 and 8 or 4, limit)
+			else
+				-- Geo 格式不使用 Protobuf 分组字段。
+				error(false)
+			end
+			if spec then values[field] = value end
+		end
+		if kind == "list" then
+			assert(entries > 0 and rules > 0)
+		elseif kind == "geoip" or kind == "geosite" or kind == "attribute" then
+			assert(values[1] and values[1] > 0)
+		elseif kind == "cidr" then
+			assert(values[1] == 4 or values[1] == 16)
+			assert((values[2] or 0) <= (values[1] == 4 and 32 or 128))
+			rules = rules + 1
+		elseif kind == "domain" then
+			assert(values[2] and values[2] > 0)
+			rules = rules + 1
+		end
+	end
+	local valid = pcall(parse, "list", size)
+	file:close()
+	return valid
+end
+
+local function GeoToRule(rule_name, rule_type, out_path)
+	local bin = api.finded_com("geoview")
+	if not (bin and api.compare_versions(api.get_app_version("geoview"), ">=", "0.1.10")) then
+		log("[警告] Geoview 组件缺失或版本过低，规则生成流程已被跳过。")
+		return false
+	end
+	local geo_type = (rule_type == "domain") and "geosite" or "geoip"
+	local geo_tag = (rule_type == "domain" and rule_name == "gfwlist") and "gfw" or "cn"
+	local file_path = asset_location .. geo_type .. ".dat"
+	if sys.call(string.format('"%s" -type %s -input "%s" | grep -q "^%s$"', bin, geo_type, file_path, geo_tag:upper())) ~= 0 then
+		log(string.format("%s 生成失败：%s.dat 中缺少 %s 标签。", rule_name, geo_type, geo_tag))
+		return false
+	end
+	local geo_arg = "-type " .. geo_type .. " -list " .. geo_tag
+	if rule_type == "ip4" then
+		geo_arg = geo_arg .. " -ipv6=false"
+	elseif rule_type == "ip6" then
+		geo_arg = geo_arg .. " -ipv4=false"
+	end
+	local cmd = string.format(bin .. " -input '%s' %s -lowmem=true -output '%s'", file_path, geo_arg, out_path)
+	local code, out = api.exec_call(cmd)
+	local local_file_size = tonumber(fs.stat(out_path, "size") or 0)
+	if code ~= 0 or local_file_size == 0 then
+		api.remove(out_path)
+		log(rule_name .. " 生成失败，原因：" .. out)
+		return false
+	end
+	return true
 end
 
 --fetch rule
-local function fetch_rule(rule_name,rule_type,url,exclude_domain)
-	local sret = 200
-	local sret_tmp = 0
-	local domains = {}
-	local file_tmp = "/tmp/" ..rule_name.. "_tmp"
-	local vali_file = "/tmp/" ..rule_name.. "_vali"
-	local download_file_tmp = "/tmp/" ..rule_name.. "_dl"
-	local unsort_file_tmp = "/tmp/" ..rule_name.. "_unsort"
-
-	log(rule_name.. " 开始更新...")
-	for k,v in ipairs(url) do
-		sret_tmp = curl(v, download_file_tmp..k, vali_file..k)
-		if sret_tmp == 200 and non_file_check(download_file_tmp..k, vali_file..k) then
-			log(rule_name.. " 第" ..k.. "条规则:" ..v.. "下载文件过程出错，尝试重新下载。")
-			os.remove(download_file_tmp..k)
-			os.remove(vali_file..k)
-			sret_tmp = curl(v, download_file_tmp..k, vali_file..k)
-			if sret_tmp == 200 and non_file_check(download_file_tmp..k, vali_file..k) then
-				sret = 0
-				sret_tmp = 0
-				log(rule_name.. " 第" ..k.. "条规则:" ..v.. "下载文件过程出错，请检查网络或下载链接后重试！")
-			end
-		end
-
-		if sret_tmp == 200 then
-			if rule_name == "gfwlist" then
-				local domains = {}
-				local gfwlist = io.open(download_file_tmp..k, "r")
-				local decode = api.base64Decode(gfwlist:read("*all"))
-				gfwlist:close()
-
-				gfwlist = io.open(download_file_tmp..k, "w")
-				gfwlist:write(decode)
-				gfwlist:close()
-			end
-
-			if rule_type == "domain" and exclude_domain == true then
-				for line in io.lines(download_file_tmp..k) do
-					if not (string.find(line, comment_pattern) or string.find(line, ip_pattern) or check_excluded_domain(line)) then
-						local start, finish, match = string.find(line, domain_pattern)
-						if (start) then
-							domains[match] = true
-						end
-					end
-				end
-
-			elseif rule_type == "domain" then
-				for line in io.lines(download_file_tmp..k) do
-					if not (string.find(line, comment_pattern) or string.find(line, ip_pattern)) then
-						local start, finish, match = string.find(line, domain_pattern)
-						if (start) then
-							domains[match] = true
-						end
-					end
-				end
-
-			elseif rule_type == "ip4" then
-				local out = io.open(unsort_file_tmp, "a")
-				for line in io.lines(download_file_tmp..k) do
-					local start, finish, match = string.find(line, ip4_ipset_pattern)
-					if (start) then
-						out:write(string.format("%s\n", line))
-					end
-				end
-				out:close()
-
-			elseif rule_type == "ip6" then
-				local out = io.open(unsort_file_tmp, "a")
-				for line in io.lines(download_file_tmp..k) do
-					local start, finish, match = string.find(line, ip6_ipset_pattern)
-					if (start) then
-						out:write(string.format("%s\n", line))
-					end
-				end
-				out:close()
-
-			end
-		else
-			sret = 0
-			log(rule_name.. " 第" ..k.. "条规则:" ..v.. "下载失败，请检查网络或下载链接后重试！")
-		end
-		os.remove(download_file_tmp..k)
-		os.remove(vali_file..k)
+local function fetch_rule(rule_name, rule_type, url, exclude_domain, max_retries)
+	local sret = 0
+	local max_attempts = max_retries or 2
+	local rule_dataset = {}
+	local file_tmp = "/tmp/" .. rule_name .. "_tmp"
+	local rule_final_path = rule_path .. "/" .. rule_name
+	if geo2rule == "1" then
+		url = {"geo2rule"}
+		log(rule_name.. " 开始生成...")
+	else
+		log(rule_name.. " 开始更新...")
 	end
 
-	if sret == 200 then
-		if rule_type == "domain" then
-			local out = io.open(unsort_file_tmp, "w")
-			for k,v in pairs(domains) do
-				out:write(string.format("%s\n", k))
+	for k, v in ipairs(url) do
+		local current_file = "/tmp/" .. rule_name .. "_dl" .. k
+		local success = false
+
+		if v ~= "geo2rule" then
+			for i = 1, max_attempts do
+				local return_code, http_code, header = curl(v, current_file)
+				if return_code == 0 and not non_file_check(current_file, header) then
+					success = true
+					break
+				end
+				api.remove(current_file)
+				log(string.format("%s 第%d条规则下载失败 (HTTP:%s)，正在进行第%d次尝试...", rule_name, k, tostring(http_code), i))
 			end
+		else
+			if not GeoToRule(rule_name, rule_type, current_file) then return 1 end
+			success = true
+		end
+
+		if success then
+			local f = io.open(current_file, "r")
+			if f then
+				if rule_name == "gfwlist" and geo2rule == "0" then
+					local decode = api.base64Decode(f:read("*all"))
+					for line in string.gmatch(decode, "[^\r\n]+") do
+						line = line:gsub("full:", "")
+						if not (is_comment_line(line) or is_ipv4(line) or has_colon(line) or (exclude_domain and check_excluded_domain(line))) then
+							local match = extract_domain(line)
+							if match and not is_ipv4(match) then
+								rule_dataset[match] = true
+							end
+						end
+					end
+				else
+					for line in f:lines() do
+						if rule_type == "domain" then
+							line = line:gsub("full:", "")
+							if not (is_comment_line(line) or is_ipv4(line) or has_colon(line) or (exclude_domain and check_excluded_domain(line))) then
+								local match = extract_domain(line)
+								if match and not is_ipv4(match) then
+									rule_dataset[match] = true
+								end
+							end
+						elseif rule_type == "ip4" then
+							local function is_0dot(s) -- "^0%..*"
+								return s and s:byte(1)==48 and s:byte(2)==46
+							end
+							if is_ipv4_cidr(line) and not is_0dot(line) then
+								rule_dataset[line] = true
+							end
+						elseif rule_type == "ip6" then
+							local function is_double_colon_cidr(s) -- "^::(/%d+)?$"
+							if not s or s:byte(1)~=58 or s:byte(2)~=58 then return false end
+								local l = #s
+								if l==2 then return true end
+								if l==3 or s:byte(3)~=47 then return false end
+								for i=4,l do
+									local b=s:byte(i)
+									if b<48 or b>57 then return false end
+								end
+								return true
+							end
+							if is_ipv6_cidr(line) and not is_double_colon_cidr(line) then
+								rule_dataset[line] = true
+							end
+						end
+					end
+				end
+				f:close()
+			end
+		else
+			sret = 1
+			log(string.format("%s 第%d条规则: %s 下载失败！", rule_name, k, v))
+		end
+		api.remove(current_file)
+	end
+
+	if sret == 0 then
+		local result_list = {}
+		for line, _ in pairs(rule_dataset) do table.insert(result_list, line) end
+		table.sort(result_list)
+
+		local out = io.open(file_tmp, "w")
+		if out then
+			for _, line in ipairs(result_list) do out:write(line .. "\n") end
 			out:close()
 		end
-		luci.sys.call("cat " ..unsort_file_tmp.. " | sort -u > "..file_tmp)
-		os.remove(unsort_file_tmp)
 
-		local old_md5 = luci.sys.exec("echo -n $(md5sum " .. rule_path .. "/" ..rule_name.. " | awk '{print $1}')")
-		local new_md5 = luci.sys.exec("echo -n $([ -f '" ..file_tmp.. "' ] && md5sum " ..file_tmp.." | awk '{print $1}')")
+		local old_md5 = api.md5_file(rule_final_path)
+		local new_md5 = api.md5_file(file_tmp)
+
 		if old_md5 ~= new_md5 then
-			local count = line_count(file_tmp)
-			if use_nft == "1" and (rule_type == "ip6" or rule_type == "ip4") then
-				local set_name = "passwall_" ..rule_name
-				local output_file = file_tmp.. ".nft"
-				if rule_type == "ip4" then
-					gen_cache(set_name, "ipv4_addr", file_tmp, output_file)
-				elseif rule_type == "ip6" then
-					gen_cache(set_name, "ipv6_addr", file_tmp, output_file)
-				end
-				luci.sys.exec(string.format('mv -f %s %s', output_file, rule_path .. "/" ..rule_name.. ".nft"))
-				os.remove(output_file)
+			if api.is_finded("fw4") and (rule_type == "ip4" or rule_type == "ip6") then
+				local nft_file = file_tmp .. ".nft"
+				local set_name = "psw_" .. rule_name
+				if rule_name == "chnroute" then set_name = "psw_chn"
+				elseif rule_name == "chnroute6" then set_name = "psw_chn6" end
+
+				local addr_type = (rule_type == "ip4") and "ipv4_addr" or "ipv6_addr"
+				gen_cache(set_name, addr_type, file_tmp, nft_file)
+				os.execute(string.format("mv -f %s %s.nft", nft_file, rule_final_path))
 			end
-			luci.sys.exec("mv -f "..file_tmp .. " " ..rule_path .. "/" ..rule_name)
-			reboot = 1
-			log(rule_name.. " 更新成功，总规则数 " ..count.. " 条。")
+			os.execute(string.format("mv -f %s %s", file_tmp, rule_final_path))
+			if not rollback then reboot = 1 end
+			log(string.format("%s 更新成功，总规则数 %d 条。", rule_name, #result_list))
 		else
-			log(rule_name.. " 版本一致，无需更新。")
+			log(rule_name .. " 版本一致，无需更新。")
+			api.remove(file_tmp)
 		end
 	else
-		log(rule_name.. " 文件下载失败！")
+		log(rule_name .. " 更新失败（部分或全部资源无法下载）。")
+		api.remove(file_tmp)
 	end
-	os.remove(file_tmp)
+	return 0
+end
+
+local function fetch_geofile(geo_name, geo_type, url)
+	local tmp_path = "/tmp/" .. geo_name
+	local asset_path = asset_location .. geo_name
+	local down_filename = url:match("^.*/([^/?#]+)")
+	local sha_url = url:gsub((down_filename:gsub("(%W)", "%%%1")), down_filename .. ".sha256sum")
+	local sha_path = tmp_path .. ".sha256sum"
+
+	local digest
+	local sha_verify = select(1, curl(sha_url, sha_path)) == 0
+	if sha_verify then
+		local f = io.open(sha_path, "r")
+		if f then
+			local content = f:read("*l")
+			f:close()
+			local hash = content and content:match("^(%x+)%s")
+			if hash and #hash == 64 then
+				digest = "sha256:" .. hash
+			end
+		end
+		if not digest then
+			log(geo_type .. " SHA256 校验信息无效，更新失败。")
+			return 1
+		end
+		if fs.access(asset_path) and api.verify_sha256(asset_path, digest) then
+			log(geo_type .. " 版本一致，无需更新。")
+			return 0
+		end
+	end
+
+	local sret_tmp, _, header = curl(url, tmp_path)
+	if sret_tmp == 0 and non_file_check(tmp_path, header) then
+		log(geo_type .. " 下载文件过程出错，尝试重新下载。")
+		api.remove(tmp_path)
+		sret_tmp, _, header= curl(url, tmp_path)
+		if sret_tmp == 0 and non_file_check(tmp_path, header) then
+			sret_tmp = 1
+			log(geo_type .. " 下载文件过程出错，请检查网络或下载链接后重试！")
+		end
+	end
+	if sret_tmp == 0 then
+		if sha_verify then
+			if api.verify_sha256(tmp_path, digest) then
+				sys.call(string.format("mkdir -p %s && mv -f %s %s", backup_path, asset_path, backup_path))
+				sys.call(string.format("mkdir -p %s && mv -f %s %s", asset_location, tmp_path, asset_path))
+				reboot = 1
+				log(geo_type .. " 更新成功。")
+				if geo_type == "geoip" then
+					geoip_update_ok = true
+				else
+					geosite_update_ok = true
+				end
+			else
+				log(geo_type .. " 更新失败，请稍后重试或更换更新URL。")
+				return 1
+			end
+		else
+			if not validate_geo_file(tmp_path, geo_type) then
+				log(geo_type .. " 文件格式校验错误，更新失败。")
+				return 1
+			end
+			if fs.access(asset_path) and sys.call(string.format("cmp -s %s %s", tmp_path, asset_path)) == 0 then
+				log(geo_type .. " 版本一致，无需更新。")
+				return 0
+			end
+			sys.call(string.format("mkdir -p %s && mv -f %s %s", backup_path, asset_path, backup_path))
+			sys.call(string.format("mkdir -p %s && mv -f %s %s", asset_location, tmp_path, asset_path))
+			reboot = 1
+			log(geo_type .. " 更新成功。")
+			if geo_type == "geoip" then
+				geoip_update_ok = true
+			else
+				geosite_update_ok = true
+			end
+		end
+	else
+		log(geo_type .. " 更新失败，请稍后重试或更换更新URL。")
+		return 1
+	end
 	return 0
 end
 
@@ -267,203 +745,158 @@ local function fetch_chnlist()
 	fetch_rule("chnlist","domain",chnlist_url,false)
 end
 
---获取geoip
 local function fetch_geoip()
-	--请求geoip
-	xpcall(function()
-		local return_code, content = api.curl_logic(geoip_api)
-		local json = jsonc.parse(content)
-		if json.tag_name and json.assets then
-			for _, v in ipairs(json.assets) do
-				if v.name and v.name == "geoip.dat.sha256sum" then
-					local sret = curl(v.browser_download_url, "/tmp/geoip.dat.sha256sum")
-					if sret == 200 then
-						local f = io.open("/tmp/geoip.dat.sha256sum", "r")
-						local content = f:read()
-						f:close()
-						f = io.open("/tmp/geoip.dat.sha256sum", "w")
-						f:write(content:gsub("geoip.dat", "/tmp/geoip.dat"), "")
-						f:close()
-
-						if nixio.fs.access(asset_location .. "geoip.dat") then
-							luci.sys.call(string.format("cp -f %s %s", asset_location .. "geoip.dat", "/tmp/geoip.dat"))
-							if luci.sys.call('sha256sum -c /tmp/geoip.dat.sha256sum > /dev/null 2>&1') == 0 then
-								log("geoip 版本一致，无需更新。")
-								return 1
-							end
-						end
-						for _2, v2 in ipairs(json.assets) do
-							if v2.name and v2.name == "geoip.dat" then
-								sret = curl(v2.browser_download_url, "/tmp/geoip.dat")
-								if luci.sys.call('sha256sum -c /tmp/geoip.dat.sha256sum > /dev/null 2>&1') == 0 then
-									luci.sys.call(string.format("mkdir -p %s && cp -f %s %s", asset_location, "/tmp/geoip.dat", asset_location .. "geoip.dat"))
-									reboot = 1
-									log("geoip 更新成功。")
-									return 1
-								else
-									log("geoip 更新失败，请稍后再试。")
-								end
-								break
-							end
-						end
-					end
-					break
-				end
-			end
-		end
-	end,
-	function(e)
-	end)
-
-	return 0
+	fetch_geofile("geoip.dat","geoip",geoip_url)
 end
 
---获取geosite
 local function fetch_geosite()
-	--请求geosite
-	xpcall(function()
-		local return_code, content = api.curl_logic(geosite_api)
-		local json = jsonc.parse(content)
-		if json.tag_name and json.assets then
-			for _, v in ipairs(json.assets) do
-				if v.name and v.name == "geosite.dat.sha256sum" then
-					local sret = curl(v.browser_download_url, "/tmp/geosite.dat.sha256sum")
-					if sret == 200 then
-						local f = io.open("/tmp/geosite.dat.sha256sum", "r")
-						local content = f:read()
-						f:close()
-						f = io.open("/tmp/geosite.dat.sha256sum", "w")
-						f:write(content:gsub("geosite.dat", "/tmp/geosite.dat"), "")
-						f:close()
-
-						if nixio.fs.access(asset_location .. "geosite.dat") then
-							luci.sys.call(string.format("cp -f %s %s", asset_location .. "geosite.dat", "/tmp/geosite.dat"))
-							if luci.sys.call('sha256sum -c /tmp/geosite.dat.sha256sum > /dev/null 2>&1') == 0 then
-								log("geosite 版本一致，无需更新。")
-								return 1
-							end
-						end
-						for _2, v2 in ipairs(json.assets) do
-							if v2.name and v2.name == "geosite.dat" then
-								sret = curl(v2.browser_download_url, "/tmp/geosite.dat")
-								if luci.sys.call('sha256sum -c /tmp/geosite.dat.sha256sum > /dev/null 2>&1') == 0 then
-									luci.sys.call(string.format("mkdir -p %s && cp -f %s %s", asset_location, "/tmp/geosite.dat", asset_location .. "geosite.dat"))
-									reboot = 1
-									log("geosite 更新成功。")
-									return 1
-								else
-									log("geosite 更新失败，请稍后再试。")
-								end
-								break
-							end
-						end
-					end
-					break
-				end
-			end
-		end
-	end,
-	function(e)
-	end)
-
-	return 0
+	fetch_geofile("geosite.dat","geosite",geosite_url)
 end
 
-if arg[2] then
-	string.gsub(arg[2], '[^' .. "," .. ']+', function(w)
+if arg2 then
+	string.gsub(arg2, '[^' .. "," .. ']+', function(w)
 		if w == "gfwlist" then
-			gfwlist_update = 1
+			gfwlist_update = "1"
 		end
 		if w == "chnroute" then
-			chnroute_update = 1
+			chnroute_update = "1"
 		end
 		if w == "chnroute6" then
-			chnroute6_update = 1
+			chnroute6_update = "1"
 		end
 		if w == "chnlist" then
-			chnlist_update = 1
+			chnlist_update = "1"
 		end
 		if w == "geoip" then
-			geoip_update = 1
+			geoip_update = "1"
 		end
 		if w == "geosite" then
-			geosite_update = 1
+			geosite_update = "1"
 		end
 	end)
+	if rollback then arg2 = nil end
 else
-	gfwlist_update = ucic:get_first(name, 'global_rules', "gfwlist_update", 1)
-	chnroute_update = ucic:get_first(name, 'global_rules', "chnroute_update", 1)
-	chnroute6_update = ucic:get_first(name, 'global_rules', "chnroute6_update", 1)
-	chnlist_update = ucic:get_first(name, 'global_rules', "chnlist_update", 1)
-	geoip_update = ucic:get_first(name, 'global_rules', "geoip_update", 1)
-	geosite_update = ucic:get_first(name, 'global_rules', "geosite_update", 1)
+	gfwlist_update = uci_get("@global_rules[0]", "gfwlist_update") or "1"
+	chnroute_update = uci_get("@global_rules[0]", "chnroute_update") or "1"
+	chnroute6_update = uci_get("@global_rules[0]", "chnroute6_update") or "1"
+	chnlist_update = uci_get("@global_rules[0]", "chnlist_update") or "1"
+	geoip_update = uci_get("@global_rules[0]", "geoip_update") or "1"
+	geosite_update = uci_get("@global_rules[0]", "geosite_update") or "1"
 end
-if gfwlist_update == 0 and chnroute_update == 0 and chnroute6_update == 0 and chnlist_update == 0 and geoip_update == 0 and geosite_update == 0 then
-	os.exit(0)
+if geo2rule ~= "1" and gfwlist_update == "0" and chnroute_update == "0" and chnroute6_update == "0" and chnlist_update == "0" and geoip_update == "0" and geosite_update == "0" then
+	update_lock:close()
+	return
 end
 
 log("开始更新规则...")
-if tonumber(gfwlist_update) == 1 then
-	xpcall(fetch_gfwlist,function(e)
+local function safe_call(func, err_msg)
+	xpcall(func, function(e)
 		log(e)
 		log(debug.traceback())
-		log('更新gfwlist发生错误...')
+		log(err_msg)
 	end)
 end
 
-if tonumber(chnroute_update) == 1 then
-	xpcall(fetch_chnroute,function(e)
-		log(e)
-		log(debug.traceback())
-		log('更新chnroute发生错误...')
-	end)
+local function remove_tmp_geofile(name)
+	api.remove("/tmp/" .. name .. ".dat")
+	api.remove("/tmp/" .. name .. ".dat.sha256sum")
 end
 
-if tonumber(chnroute6_update) == 1 then
-	xpcall(fetch_chnroute6,function(e)
-		log(e)
-		log(debug.traceback())
-		log('更新chnroute6发生错误...')
-	end)
+if geo2rule == "1" then
+	if geoip_update == "1" and not rollback then
+		log("geoip 开始更新...")
+		safe_call(fetch_geoip, "更新geoip发生错误...")
+		remove_tmp_geofile("geoip")
+	end
+
+	if geosite_update == "1" and not rollback then
+		log("geosite 开始更新...")
+		safe_call(fetch_geosite, "更新geosite发生错误...")
+		remove_tmp_geofile("geosite")
+	end
+
+	-- 如果是手动更新(arg2存在)始终生成规则
+	if arg2 then
+		geoip_update_ok, geosite_update_ok = true, true
+	end
+	if not rollback then
+		chnroute_update, chnroute6_update, gfwlist_update, chnlist_update = "1", "1", "1", "1"
+	end
+
+	if geoip_update_ok then
+		if fs.access(asset_location .. "geoip.dat") then
+			if chnroute_update == "1" then
+				safe_call(fetch_chnroute, "生成chnroute发生错误...")
+			end
+			if chnroute6_update == "1" then
+				safe_call(fetch_chnroute6, "生成chnroute6发生错误...")
+			end
+		else
+			log("geoip.dat 文件不存在,跳过规则生成。")
+		end
+	end
+
+	if geosite_update_ok then
+		if fs.access(asset_location .. "geosite.dat") then
+			if gfwlist_update == "1" then
+				safe_call(fetch_gfwlist, "生成gfwlist发生错误...")
+			end
+			if chnlist_update == "1" then
+				safe_call(fetch_chnlist, "生成chnlist发生错误...")
+			end
+		else
+			log("geosite.dat 文件不存在,跳过规则生成。")
+		end
+	end
+else
+	if gfwlist_update == "1" then
+		safe_call(fetch_gfwlist, "更新gfwlist发生错误...")
+	end
+
+	if chnroute_update == "1" then
+		safe_call(fetch_chnroute, "更新chnroute发生错误...")
+	end
+
+	if chnroute6_update == "1" then
+		safe_call(fetch_chnroute6, "更新chnroute6发生错误...")
+	end
+
+	if chnlist_update == "1" then
+		safe_call(fetch_chnlist, "更新chnlist发生错误...")
+	end
+
+	if geoip_update == "1" then
+		log("geoip 开始更新...")
+		safe_call(fetch_geoip, "更新geoip发生错误...")
+		remove_tmp_geofile("geoip")
+	end
+
+	if geosite_update == "1" then
+		log("geosite 开始更新...")
+		safe_call(fetch_geosite, "更新geosite发生错误...")
+		remove_tmp_geofile("geosite")
+	end
 end
 
-if tonumber(chnlist_update) == 1 then
-	xpcall(fetch_chnlist,function(e)
-		log(e)
-		log(debug.traceback())
-		log('更新chnlist发生错误...')
-	end)
+if not rollback then
+	uci_set("@global_rules[0]", "gfwlist_update", gfwlist_update)
+	uci_set("@global_rules[0]", "chnroute_update", chnroute_update)
+	uci_set("@global_rules[0]", "chnroute6_update", chnroute6_update)
+	uci_set("@global_rules[0]", "chnlist_update", chnlist_update)
+	uci_set("@global_rules[0]", "geoip_update", geoip_update)
+	uci_set("@global_rules[0]", "geosite_update", geosite_update)
+	uci_save(true)
 end
-
-if tonumber(geoip_update) == 1 then
-	log("geoip 开始更新...")
-	local status = fetch_geoip()
-	os.remove("/tmp/geoip.dat")
-	os.remove("/tmp/geoip.dat.sha256sum")
-end
-
-if tonumber(geosite_update) == 1 then
-	log("geosite 开始更新...")
-	local status = fetch_geosite()
-	os.remove("/tmp/geosite.dat")
-	os.remove("/tmp/geosite.dat.sha256sum")
-end
-
-ucic:set(name, ucic:get_first(name, 'global_rules'), "gfwlist_update", gfwlist_update)
-ucic:set(name, ucic:get_first(name, 'global_rules'), "chnroute_update", chnroute_update)
-ucic:set(name, ucic:get_first(name, 'global_rules'), "chnroute6_update", chnroute6_update)
-ucic:set(name, ucic:get_first(name, 'global_rules'), "chnlist_update", chnlist_update)
-ucic:set(name, ucic:get_first(name, 'global_rules'), "geoip_update", geoip_update)
-ucic:set(name, ucic:get_first(name, 'global_rules'), "geosite_update", geosite_update)
-ucic:save(name)
-luci.sys.call("uci commit " .. name)
 
 if reboot == 1 then
 	log("重启服务，应用新的规则。")
-	if use_nft == "1" then
-		luci.sys.call("sh /usr/share/" .. name .. "/nftables.sh flush_nftset > /dev/null 2>&1 &")
-	else
-		luci.sys.call("sh /usr/share/" .. name .. "/iptables.sh flush_ipset > /dev/null 2>&1 &")
-	end
+	uci_set("@global[0]", "flush_set", "1")
+	uci_save(true)
 end
-log("规则更新完毕...")
+log("规则更新完毕...\n")
+
+update_lock:close()
+if reboot == 1 then
+	local action = arg3 == "cron" and " cron" or ""
+	luci.sys.call("/etc/init.d/passwall restart" .. action .. " > /dev/null 2>&1 &")
+end

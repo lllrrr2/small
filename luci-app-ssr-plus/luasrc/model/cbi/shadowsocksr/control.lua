@@ -1,5 +1,6 @@
 require "luci.ip"
 require "nixio.fs"
+require "luci.sys"
 local m, s, o
 
 m = Map("shadowsocksr")
@@ -20,10 +21,10 @@ o.description = translate("Listen only on the given interface or, if unspecified
 s:tab("wan_ac", translate("WAN IP AC"))
 
 o = s:taboption("wan_ac", DynamicList, "wan_bp_ips", translate("WAN White List IP"))
-o.datatype = "ip4addr"
+o.datatype = "ipaddr"
 
 o = s:taboption("wan_ac", DynamicList, "wan_fw_ips", translate("WAN Force Proxy IP"))
-o.datatype = "ip4addr"
+o.datatype = "ipaddr"
 
 -- Part of LAN
 s:tab("lan_ac", translate("LAN IP AC"))
@@ -36,7 +37,7 @@ o.rmempty = false
 
 o = s:taboption("lan_ac", DynamicList, "lan_ac_ips", translate("LAN Host List"))
 o.datatype = "ipaddr"
-luci.ip.neighbors({family = 4}, function(entry)
+luci.ip.neighbors({}, function(entry)
 	if entry.reachable then
 		o:value(entry.dest:string())
 	end
@@ -46,7 +47,7 @@ o:depends("lan_ac_mode", "b")
 
 o = s:taboption("lan_ac", DynamicList, "lan_bp_ips", translate("LAN Bypassed Host List"))
 o.datatype = "ipaddr"
-luci.ip.neighbors({family = 4}, function(entry)
+luci.ip.neighbors({}, function(entry)
 	if entry.reachable then
 		o:value(entry.dest:string())
 	end
@@ -54,7 +55,7 @@ end)
 
 o = s:taboption("lan_ac", DynamicList, "lan_fp_ips", translate("LAN Force Proxy Host List"))
 o.datatype = "ipaddr"
-luci.ip.neighbors({family = 4}, function(entry)
+luci.ip.neighbors({}, function(entry)
 	if entry.reachable then
 		o:value(entry.dest:string())
 	end
@@ -62,7 +63,7 @@ end)
 
 o = s:taboption("lan_ac", DynamicList, "lan_gm_ips", translate("Game Mode Host List"))
 o.datatype = "ipaddr"
-luci.ip.neighbors({family = 4}, function(entry)
+luci.ip.neighbors({}, function(entry)
 	if entry.reachable then
 		o:value(entry.dest:string())
 	end
@@ -124,20 +125,13 @@ o.remove = function(self, section, value)
 	nixio.fs.writefile(denydomainconf, "")
 end
 
-s:tab("netflix", translate("Netflix Domain List"))
-local netflixconf = "/etc/ssrplus/netflix.list"
-o = s:taboption("netflix", TextValue, "netflixconf")
-o.rows = 13
-o.wrap = "off"
-o.rmempty = true
-o.cfgvalue = function(self, section)
-	return nixio.fs.readfile(netflixconf) or " "
+if luci.sys.call('[ -f "/www/luci-static/resources/uci.js" ]') == 0 then
+	m.apply_on_parse = true
+	function m.on_apply(self)
+		luci.sys.call("/etc/init.d/shadowsocksr reload > /dev/null 2>&1 &")
+	end
 end
-o.write = function(self, section, value)
-	nixio.fs.writefile(netflixconf, value:gsub("\r\n", "\n"))
-end
-o.remove = function(self, section, value)
-	nixio.fs.writefile(netflixconf, "")
-end
+
+m:append(Template("shadowsocksr/control_layout"))
 
 return m

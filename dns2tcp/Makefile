@@ -5,21 +5,19 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=dns2tcp
-PKG_VERSION:=1.1.0
+PKG_VERSION:=1.1.2
 PKG_RELEASE:=2
 
-PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/zfl9/dns2tcp.git
-PKG_SOURCE_DATE:=2023-04-15
-PKG_SOURCE_VERSION:=558b07e4c1f9bd5be19e60892a0bce7661ed99a5
-PKG_MIRROR_HASH:=872b420cb0d555390ce03a6bf6df32d33b33cdc9a734fac1f758d6d65e8adf7f
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+PKG_SOURCE_URL:=https://codeload.github.com/zfl9/dns2tcp/tar.gz/v$(PKG_VERSION)?
+PKG_HASH:=5e8c6302a1d32c16ae7d4b8e39cd9aad1f2d7e68fe18813e76cb1e48ec5940d2
 
 PKG_MAINTAINER:=Tianling Shen <cnsztl@immortalwrt.org>
 PKG_LICENSE:=AGPL-3.0-only
 PKG_LICENSE_FILES:=LICENSE
 
 PKG_BUILD_PARALLEL:=1
-PKG_USE_MIPS16:=0
+PKG_BUILD_FLAGS:=no-mips16 gc-sections lto
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -31,7 +29,7 @@ define Package/dns2tcp
   URL:=https://github.com/zfl9/dns2tcp
 endef
 
-TARGET_CFLAGS+= $(FPIC) -flto
+TARGET_CFLAGS+= $(FPIC)
 MAKE_FLAGS+= \
 	CFLAGS="-std=c99 $(TARGET_CFLAGS)" \
 	EVCFLAGS="$(TARGET_CFLAGS)"

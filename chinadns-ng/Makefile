@@ -3,38 +3,46 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=chinadns-ng
-PKG_VERSION:=2024.03.27
+PKG_VERSION:=2025.08.09
 PKG_RELEASE:=1
 
 ifeq ($(ARCH),aarch64)
-  PKG_ARCH:=chinadns-ng@aarch64-linux-musl@generic+v8a@fast+lto
-  PKG_HASH:=5255a5393d0923ca378f1076eefa8719ab301b25398ab0280e026cdc6316b0e4
+  ifeq ($(BOARD),rockchip)
+    PKG_ARCH:=chinadns-ng+wolfssl@aarch64-linux-musl@generic+v8a@fast+lto
+    PKG_HASH:=3fe0217615dd7060b7287d2b6b31d2a0b364137398bfb335a03bead322eac716
+  else
+    PKG_ARCH:=chinadns-ng+wolfssl_noasm@aarch64-linux-musl@generic+v8a@fast+lto
+    PKG_HASH:=42ddd494200ec6d88b35902927688d316bc23e06e6c08d9e01eb2412196ab845
+  endif
 else ifeq ($(ARCH),arm)
   ARM_CPU_FEATURES:=$(word 2,$(subst +,$(space),$(call qstrip,$(CONFIG_CPU_TYPE))))
   ifeq ($(ARM_CPU_FEATURES),)
-    PKG_ARCH:=chinadns-ng@arm-linux-musleabi@generic+v7a@fast+lto
-    PKG_HASH:=c2e0378e20f5fda376d4f52bfbe1a3dbc7dfe23879e8edc8ef7ab55694cfd676
+    PKG_ARCH:=chinadns-ng+wolfssl@arm-linux-musleabi@generic+v6+soft_float@fast+lto
+    PKG_HASH:=0a401d1dc11129481b2baf86f847d55d66bd7e725cba4bf57875fdad27ef0052
   else
-    PKG_ARCH:=chinadns-ng@arm-linux-musleabihf@generic+v7a@fast+lto
-    PKG_HASH:=d065c7d55b6c43b20dbb668d7bdafabe371c3360cc75bd0279cc2d7a83e342e9
+    PKG_ARCH:=chinadns-ng+wolfssl@arm-linux-musleabihf@generic+v7a@fast+lto
+    PKG_HASH:=dfa1f6ba80fb0925613822f4c4e00df8da68e7b8b772048d26a0d1a9d07d346b
   endif
 else ifeq ($(ARCH),mips)
-  PKG_ARCH:=chinadns-ng@mips-linux-musl@mips32+soft_float@fast+lto
-  PKG_HASH:=2170011ecf8ee29057d805eb8054bcc4366b759f454c063f0a258c84403e416e
+  PKG_ARCH:=chinadns-ng+wolfssl@mips-linux-musl@mips32+soft_float@fast+lto
+  PKG_HASH:=b610821a8f61b0ed3c8c7e82e10d401348a9de17f900988589024a37c4099c8e
 else ifeq ($(ARCH),mipsel)
-  PKG_ARCH:=chinadns-ng@mipsel-linux-musl@mips32+soft_float@fast+lto
-  PKG_HASH:=9ac1462187b3b06173f908295d45fd0fa3e37eb50171e22198e29dd81710b268
+  PKG_ARCH:=chinadns-ng+wolfssl@mipsel-linux-musl@mips32+soft_float@fast+lto
+  PKG_HASH:=760544a88724e3b1b9eac79c9400231e81aa8786f8f00a979229e175811ffe6d
+else ifeq ($(ARCH),mips64)
+  PKG_ARCH:=chinadns-ng+wolfssl@mips64-linux-musl@mips64+soft_float@fast+lto
+  PKG_HASH:=2d0fce18a7ef1d74fdc12738767e66998a52c2b30d8790da760933853fe8726e
 else ifeq ($(ARCH),i386)
-  PKG_ARCH:=chinadns-ng@i386-linux-musl@i686@fast+lto
-  PKG_HASH:=bf22fb35fba5e9b1174b0334a5473d4db8b3f85e489cec5af94f9a92f7c9787b
+  PKG_ARCH:=chinadns-ng+wolfssl@i386-linux-musl@i686@fast+lto
+  PKG_HASH:=85e057dd0a0e8913b30471737436ab8b71834c494ed9f9e53544261b1ffdc8d6
 else ifeq ($(ARCH),x86_64)
-  PKG_ARCH:=chinadns-ng@x86_64-linux-musl@x86_64@fast+lto
-  PKG_HASH:=8adf68d15068a3a27588772deb19be0a9804077a075aa8dad9dafa12a154c529
+  PKG_ARCH:=chinadns-ng+wolfssl@x86_64-linux-musl@x86_64@fast+lto
+  PKG_HASH:=842ea4e9816efd91d39bc76ead5c4a42e79011757e37c521b4270b675cfcb30c
 else
   PKG_HASH:=dummy
 endif
 
-PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-$(ARCH_PACKAGES)
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-$(PKG_ARCH)
 PKG_SOURCE_URL:=https://github.com/zfl9/chinadns-ng/releases/download/$(PKG_VERSION)/$(PKG_ARCH)?
 UNPACK_CMD=$(CP) $(DL_DIR)/$(PKG_SOURCE) $(PKG_BUILD_DIR)/$(PKG_NAME)
 
@@ -50,7 +58,7 @@ define Package/chinadns-ng
   SUBMENU:=IP Addresses and Names
   TITLE:=ChinaDNS next generation, refactoring with epoll and ipset.
   URL:=https://github.com/zfl9/chinadns-ng
-  DEPENDS:=@(aarch64||arm||i386||mips||mipsel||x86_64) @!(TARGET_x86_geode||TARGET_x86_legacy) +ipset
+  DEPENDS:=@(aarch64||arm||i386||mips||mipsel||mips64||x86_64) +ipset
 endef
 
 define Build/Compile

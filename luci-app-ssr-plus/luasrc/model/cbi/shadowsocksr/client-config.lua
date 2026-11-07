@@ -4,19 +4,200 @@
 require "nixio.fs"
 require "luci.sys"
 require "luci.http"
-require "luci.model.ipkg"
+require "luci.jsonc"
+local nixio = require "nixio"
+require "luci.model.uci"
+local uci = require "luci.model.uci".cursor()
 
 local m, s, o
+
 local sid = arg[1]
 local uuid = luci.sys.exec("cat /proc/sys/kernel/random/uuid")
+local b64decode = nixio.bin.b64decode
+local b64encode = nixio.bin.b64encode
+local xray_version = nil
+local xray_version_val = 0
 
+-- 确保正确判断程序是否存在
 local function is_finded(e)
-	return luci.sys.exec('type -t -p "%s"' % e) ~= "" and true or false
+	return luci.sys.exec(string.format('type -t -p "%s" -p "/usr/libexec/%s" 2>/dev/null', e, e)) ~= ""
 end
 
 local function is_installed(e)
 	return luci.model.ipkg.installed(e)
 end
+
+local function is_js_luci()
+	return luci.sys.call('[ -f "/www/luci-static/resources/uci.js" ]') == 0
+end
+
+-- trim
+local function trim(text)
+	if not text or text == "" then
+		return ""
+	end
+	return (text:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+-- base64 解码
+local function base64Decode(text)
+	local raw = text
+	if not text or text == "" then
+		return ''
+	end
+	text = text:gsub("%z", "")
+	text = text:gsub("%c", "")
+	text = text:gsub("%s", "")
+	text = text:gsub("_", "/")
+	text = text:gsub("-", "+")
+	text = text:gsub("=", "")
+	local mod4 = #text % 4
+	text = text .. string.sub('====', mod4 + 1)
+	local result = b64decode(text)
+	if result then
+		return result:gsub("%z", "")
+	else
+		return raw
+	end
+end
+
+-- base64 编码
+local function base64Encode(text)
+	if not text or text == "" then
+		return ''
+	end
+	local result = b64encode(text)
+	if result then
+		result = result:gsub("%z", "")
+		return result
+	else
+		return text
+	end
+end
+
+local function parse_realm_uri(uri)
+	uri = trim(uri)
+	if uri == "" then return nil end
+	-- realm[+http]://token@server/realm_id?query
+	local scheme = (uri:match("^realm%+http://") and "realm+http") or (uri:match("^realm://") and "realm")
+	if not scheme then return nil end
+	uri = uri:gsub("^realm%+http://", ""):gsub("^realm://", "")
+	local token, server_url, realm_id, query = uri:match("^([^@]+)@([^/]+)/([^?]*)%??(.*)$")
+	if not token or not server_url or not realm_id then return nil end
+	realm_id = realm_id:gsub("/+$", "")
+	local address, port = server_url:match("^%[([^%]]+)%]:(%d+)$") --ipv6:port
+	if not address then
+		address, port = server_url:match("^([^:]+):(%d+)$") --ipv4[domain]:port
+	end
+	address = address or server_url:match("^%[([^%]]+)%]$") or server_url
+	port = tonumber(port) or (scheme == "realm+http" and 80 or 443)
+	local realm = {
+		scheme = scheme,
+		token = token,
+		server_url = server_url,
+		address = address,
+		port = port,
+		realm_id = realm_id
+	}
+	-- 解析 query 中的 stun=
+	local stun_servers
+	for v in (query or ""):gmatch("[Ss][Tt][Uu][Nn]=([^&]+)") do
+		stun_servers = stun_servers or {}
+		stun_servers[#stun_servers + 1] = v
+	end
+	realm.stun_servers = stun_servers
+	return realm
+end
+
+-- 获取 Xray 版本号
+if is_finded("xray") then
+	local version = luci.sys.exec("xray version 2>&1")
+	if version and version ~= "" then
+		xray_version = version:match("Xray%s+([%d%.]+)")
+		-- xray_version = version:match("([0-9]+%.[0-9]+%.[0-9]+)")
+	end
+end
+
+-- 将 Xray 版本号转换为数字
+if xray_version and xray_version ~= "" then
+	local major, minor, patch =
+		xray_version:match("(%d+)%.?(%d*)%.?(%d*)")
+
+	major = tonumber(major) or 0
+	minor = tonumber(minor) or 0
+	patch = tonumber(patch) or 0
+
+	xray_version_val = major * 10000 + minor * 100 + patch
+end
+
+local function url(...)
+	local url = string.format("admin/services/%s", "shadowsocksr")
+	local args = { ... }
+	for i, v in ipairs(args) do
+		if v and v ~= "" then
+			url = url .. "/" .. v
+		end
+	end
+	return require "luci.dispatcher".build_url(url)
+end
+
+-- 默认的保存并应用行为
+local function apply_redirect(m)
+	local tmp_uci_file = "/etc/config/shadowsocksr_redirect"
+	if m.redirect and m.redirect ~= "" then
+		-- 如果存在临时文件，读取 URL 并通过 luci.http.redirect 跳转
+		if nixio.fs.access(tmp_uci_file) then
+			local redirect_url
+			for line in io.lines(tmp_uci_file) do
+				redirect_url = line:match("option%s+url%s+['\"]([^'\"]+)['\"]")
+				if redirect_url and redirect_url ~= "" then break end
+			end
+			if redirect_url and redirect_url ~= "" then
+				-- 使用 nixio 安全删除文件，替代外部 Shell 命令
+				nixio.fs.remove(tmp_uci_file)
+				-- JS 版 LuCI 依赖 luci.http.redirect 向前端重定向
+				luci.http.redirect(redirect_url)
+				return
+			end
+		else
+			-- 创建标记文件
+			nixio.fs.writefile(tmp_uci_file, "config redirect\n")
+		end
+		-- 挂载保存回调
+		local old_on_after_save = m.on_after_save
+		m.on_after_save = function(self)
+			if old_on_after_save then old_on_after_save(self) end
+			local target = self.redirect
+			if target and target ~= "" then
+				-- 使用标准的 nixio.fs 写入文件，保持格式一致
+				local content = string.format("config redirect\n\toption url '%s'\n", target)
+				nixio.fs.writefile(tmp_uci_file, content)
+			end
+		end
+	else
+		-- 不满足重定向条件时清理文件
+		if nixio.fs.access(tmp_uci_file) then
+			nixio.fs.remove(tmp_uci_file)
+		end
+	end
+end
+
+local function set_apply_on_parse(m)
+	if not m then return end
+	-- is_js_luci 保护
+	if is_js_luci and is_js_luci() then
+		apply_redirect(m)
+		local old_on_after_save = m.on_after_save
+		m.on_after_save = function(self)
+			if old_on_after_save then old_on_after_save(self) end
+			-- m:set("@global[0]", "timestamp", os.time())
+		end
+	end
+end
+
+local has_ss_rust = is_finded("sslocal") or is_finded("ssserver")
+local has_mihomo = is_finded("mihomo")
+local has_xray = is_finded("xray")
 
 local server_table = {}
 local encrypt_methods = {
@@ -78,7 +259,7 @@ local encrypt_methods_ss = {
 	"camellia-256-cfb",
 	"salsa20",
 	"chacha20",
-	"chacha20-ietf" ]]
+	"chacha20-ietf" ]]--
 }
 
 local protocol = {
@@ -121,46 +302,112 @@ local tls_flows = {
 	"none"
 }
 
+local function migrate_xray_protocol_nodes()
+	local changed = false
+
+	uci:foreach("shadowsocksr", "servers", function(section)
+		local sid = section[".name"]
+		local stype = section.type
+		local proto = section.v2ray_protocol
+		local escaped_sid = luci.util.shellquote(sid)
+
+		if stype == "ss" or stype == "ss-libev" then
+			if has_mihomo then
+				luci.sys.call(string.format("uci set shadowsocksr.%s.type='ss'", escaped_sid))
+				changed = true
+			elseif has_ss_rust then
+				luci.sys.call(string.format("uci set shadowsocksr.%s.type='ss-rust'", escaped_sid))
+				changed = true
+			elseif has_xray then
+				luci.sys.call(string.format("uci set shadowsocksr.%s.type='v2ray' && " .. "uci set shadowsocksr.%s.v2ray_protocol='shadowsocks'", escaped_sid, escaped_sid))
+				changed = true
+			end
+		elseif stype == "v2ray" and proto == "shadowsocks" and has_mihomo then
+			luci.sys.call(string.format("uci set shadowsocksr.%s.type='ss' && " .. "uci delete shadowsocksr.%s.v2ray_protocol", escaped_sid, escaped_sid))
+			changed = true
+		end
+		if stype == "anytls" then
+			uci:set("shadowsocksr", sid, "type", "v2ray")
+			uci:set("shadowsocksr", sid, "v2ray_protocol", "anytls")
+			if not section.tls then uci:set("shadowsocksr", sid, "tls", "1") end
+			uci:save("shadowsocksr")
+			changed = true
+		end
+		if stype == "hysteria2" then
+			luci.sys.call(string.format("uci set shadowsocksr.%s.type='v2ray' && " .. "uci set shadowsocksr.%s.v2ray_protocol='hysteria2'", escaped_sid, escaped_sid))
+			changed = true
+		elseif stype == "trojan" then
+			luci.sys.call(string.format("uci set shadowsocksr.%s.type='v2ray' && " .. "uci set shadowsocksr.%s.v2ray_protocol='trojan'", escaped_sid, escaped_sid))
+			changed = true
+		end
+	end)
+	local subscribe_sid = uci:get_first("shadowsocksr", "server_subscribe")
+	if subscribe_sid then
+		local old_options = {"xray_hy2_type", "xray_tj_type", "ss_type"}
+		local escaped_sub_sid = luci.util.shellquote(subscribe_sid)
+		for _, opt in ipairs(old_options) do
+			if uci:get("shadowsocksr", subscribe_sid, opt) then
+				luci.sys.call(string.format("uci delete shadowsocksr.%s.%s", escaped_sub_sid, opt))
+				changed = true
+			end
+		end
+	end
+	if changed then
+		luci.sys.call("uci commit shadowsocksr")
+	end
+end
+
+migrate_xray_protocol_nodes()
+
 m = Map("shadowsocksr", translate("Edit ShadowSocksR Server"))
-m.redirect = luci.dispatcher.build_url("admin/services/shadowsocksr/servers")
-if m.uci:get("shadowsocksr", sid) ~= "servers" then
+m.redirect = url("servers")
+if not sid or m.uci:get("shadowsocksr", sid) ~= "servers" then
 	luci.http.redirect(m.redirect)
 	return
 end
+-- 保存&应用成功后跳转到节点列表
+set_apply_on_parse(m, function(self)
+	local node_type = self.uci:get("shadowsocksr", sid, "type")
+	if node_type == "clash" then
+		luci.sys.call(string.format("/etc/init.d/shadowsocksr clash_cache %s >/dev/null 2>&1 &", sid))
+	end
+end)
+
+local server_header = Template("/shadowsocksr/server_header")
+server_header.section = sid
+m:append(server_header)
 
 -- [[ Servers Setting ]]--
 s = m:section(NamedSection, sid, "servers")
 s.anonymous = true
 s.addremove = false
 
-o = s:option(DummyValue, "ssr_url", "SS/SSR/V2RAY/TROJAN URL")
+o = s:option(DummyValue, "ssr_url", "SS/SSR/V2RAY/TROJAN/TUIC/HYSTERIA2 URL")
 o.rawhtml = true
 o.template = "shadowsocksr/ssrurl"
 o.value = sid
 
+-- 新增一个选择框，用于选择 Xray 或 Trojan 核心
 o = s:option(ListValue, "type", translate("Server Node Type"))
-if is_finded("xray") or is_finded("v2ray") then
+if is_finded("xray") then
 	o:value("v2ray", translate("V2Ray/XRay"))
 end
 if is_finded("ssr-redir") then
 	o:value("ssr", translate("ShadowsocksR"))
 end
-if is_finded("ss-local") or is_finded("ss-redir") then
-	o:value("ss", translate("Shadowsocks-libev Version"))
+if has_mihomo then
+	o:value("ss", translate("ShadowSocks"))
 end
-if is_finded("sslocal") or is_finded("ssmanager") then
-	o:value("ss", translate("Shadowsocks-rust Version"))
-end
-if is_finded("trojan") then
-	o:value("trojan", translate("Trojan"))
+if has_ss_rust then
+	o:value("ss-rust", translate("ShadowSocks-Rust"))
 end
 if is_finded("naive") then
 	o:value("naiveproxy", translate("NaiveProxy"))
 end
-if is_finded("hysteria") then
-	o:value("hysteria", translate("Hysteria"))
+if is_finded("mihomo") then
+	o:value("clash", translate("Clash/Mihomo"))
 end
-if is_finded("tuic-client") then
+if is_finded("mihomo") then
 	o:value("tuic", translate("TUIC"))
 end
 if is_finded("shadow-tls") and is_finded("sslocal") then
@@ -169,60 +416,130 @@ end
 if is_finded("ipt2socks") then
 	o:value("socks5", translate("Socks5"))
 end
-if is_finded("redsocks2") then
-	o:value("tun", translate("Network Tunnel"))
+local old_cfgvalue = o.cfgvalue
+o.cfgvalue = function(self, section)
+	local val = self.map.uci:get("shadowsocksr", section, "type")
+	if old_cfgvalue then
+		return old_cfgvalue(self, section)
+	end
+	return val
 end
-
 o.description = translate("Using incorrect encryption mothod may causes service fail to start")
 
 o = s:option(Value, "alias", translate("Alias(optional)"))
 
-o = s:option(ListValue, "iface", translate("Network interface to use"))
-for _, e in ipairs(luci.sys.net.devices()) do
-	if e ~= "lo" then
-		o:value(e)
+local function clash_source_formvalue(map, section, option)
+	local value = map:formvalue("cbid." .. map.config .. "." .. section .. "." .. option)
+	if value == nil then
+		value = map.uci:get(map.config, section, option)
 	end
+	return trim(value or "")
 end
-o:depends("type", "tun")
-o.description = translate("Redirect traffic to this network interface")
+
+local function validate_clash_source(self, value, section)
+	local clash_url = clash_source_formvalue(self.map, section, "clash_url")
+	local clash_path = clash_source_formvalue(self.map, section, "clash_path")
+	if clash_url == "" and clash_path == "" then
+		return nil, translate("Please specify either a Clash subscription URL or a local YAML path.")
+	end
+	return value
+end
+
+o = s:option(Value, "clash_url", translate("Clash Subscription URL"))
+o.placeholder = "https://example.com/config.yaml"
+o.rmempty = true
+o:depends("type", "clash")
+o.validate = validate_clash_source
+
+o = s:option(Value, "clash_path", translate("Clash YAML Path"))
+o.placeholder = "/etc/ssrplus/clash/custom.yaml"
+o.rmempty = true
+o:depends("type", "clash")
+o.validate = validate_clash_source
+
+o = s:option(Value, "clash_user_agent", translate("Clash User-Agent"))
+o.default = "clash"
+o.rmempty = false
+o:depends("type", "clash")
 
 o = s:option(ListValue, "v2ray_protocol", translate("V2Ray/XRay protocol"))
 o:value("vless", translate("VLESS"))
 o:value("vmess", translate("VMess"))
 o:value("trojan", translate("Trojan"))
-o:value("shadowsocks", translate("Shadowsocks"))
+if is_finded("xray") or is_finded("mihomo") then
+	o:value("anytls", "AnyTLS")
+end
+o:value("shadowsocks", translate("ShadowSocks"))
 if is_finded("xray") then
 	o:value("wireguard", translate("WireGuard"))
+	o:value("naive", "NaiveProxy (Xray / Cronet)")
+	o:value("shadowsocksr", "ShadowsocksR (Xray)")
+	o:value("tuic", "TUIC (Xray)")
+end
+if is_finded("xray") then
+	o:value("hysteria2", translate("Hysteria2"))
+end
+if is_finded("xray") then
+	o:value("masque", translate("MASQUE"))
+end
+if is_finded("xray") or is_finded("mihomo") then
+	o:value("snell", translate("Snell"))
 end
 o:value("socks", translate("Socks"))
 o:value("http", translate("HTTP"))
 o:depends("type", "v2ray")
 
 o = s:option(Value, "server", translate("Server Address"))
-o.datatype = "host"
+o.datatype = "or(host,ip6addr)"
 o.rmempty = false
 o:depends("type", "ssr")
 o:depends("type", "ss")
-o:depends("type", "v2ray")
+o:depends("type", "ss-rust")
 o:depends("type", "trojan")
 o:depends("type", "naiveproxy")
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
+o:depends("type", "masque")
 o:depends("type", "tuic")
 o:depends("type", "shadowtls")
 o:depends("type", "socks5")
+local protocols = s.fields["v2ray_protocol"].keylist
+if protocols and type(protocols) == "table" and #protocols > 0 then
+	for _, proto in ipairs(protocols) do
+		if not proto:find("^_") then
+			if proto == "hysteria2" then
+				o:depends({type = "v2ray", v2ray_protocol = "hysteria2", hysteria2_realms = false})
+			else
+				o:depends({type = "v2ray", v2ray_protocol = proto})
+			end
+		end
+	end
+end
 
 o = s:option(Value, "server_port", translate("Server Port"))
 o.datatype = "port"
 o.rmempty = true
 o:depends("type", "ssr")
 o:depends("type", "ss")
-o:depends("type", "v2ray")
+o:depends("type", "ss-rust")
 o:depends("type", "trojan")
 o:depends("type", "naiveproxy")
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
+o:depends("type", "masque")
 o:depends("type", "tuic")
 o:depends("type", "shadowtls")
 o:depends("type", "socks5")
+local protocols = s.fields["v2ray_protocol"].keylist
+if protocols and type(protocols) == "table" and #protocols > 0 then
+	for _, proto in ipairs(protocols) do
+		if not proto:find("^_") then
+			if proto == "hysteria2" then
+				o:depends({type = "v2ray", v2ray_protocol = "hysteria2", hysteria2_realms = false})
+			else
+				o:depends({type = "v2ray", v2ray_protocol = proto})
+			end
+		end
+	end
+end
 
 o = s:option(Flag, "auth_enable", translate("Enable Authentication"))
 o.rmempty = false
@@ -230,27 +547,102 @@ o.default = "0"
 o:depends("type", "socks5")
 o:depends({type = "v2ray", v2ray_protocol = "http"})
 o:depends({type = "v2ray", v2ray_protocol = "socks"})
+o:depends({type = "v2ray", v2ray_protocol = "masque"})
 
 o = s:option(Value, "username", translate("Username"))
 o.rmempty = true
 o:depends("type", "naiveproxy")
+o:depends({type = "v2ray", v2ray_protocol = "naive"})
 o:depends({type = "socks5", auth_enable = true})
 o:depends({type = "v2ray", v2ray_protocol = "http", auth_enable = true})
 o:depends({type = "v2ray", v2ray_protocol = "socks", auth_enable = true})
+o:depends({type = "v2ray", v2ray_protocol = "masque", auth_enable = true})
 
 o = s:option(Value, "password", translate("Password"))
 o.password = true
 o.rmempty = true
 o:depends("type", "ssr")
 o:depends("type", "ss")
+o:depends("type", "ss-rust")
 o:depends("type", "trojan")
 o:depends("type", "naiveproxy")
 o:depends("type", "shadowtls")
 o:depends({type = "socks5", auth_enable = true})
 o:depends({type = "v2ray", v2ray_protocol = "http", auth_enable = true})
 o:depends({type = "v2ray", v2ray_protocol = "socks", socks_ver = "5", auth_enable = true})
+o:depends({type = "v2ray", v2ray_protocol = "masque", auth_enable = true})
 o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
 o:depends({type = "v2ray", v2ray_protocol = "trojan"})
+o:depends({type = "v2ray", v2ray_protocol = "anytls"})
+o:depends({type = "v2ray", v2ray_protocol = "naive"})
+o:depends({type = "v2ray", v2ray_protocol = "shadowsocksr"})
+
+for _, field in ipairs({
+	{"anytls_idle_session_check_interval", "Idle session check interval (seconds)", "30"},
+	{"anytls_idle_session_timeout", "Idle session timeout (seconds)", "30"},
+	{"anytls_min_idle_session", "Minimum idle sessions", "0"}
+}) do
+	o = s:option(Value, field[1], translate(field[2]))
+	o.placeholder = field[3]
+	o.datatype = "uinteger"
+	o.rmempty = true
+	o:depends({type = "v2ray", v2ray_protocol = "anytls"})
+end
+
+-- [[ MASQUE ]] --
+o = s:option(Flag, "masque_warp", "WARP")
+o.default = "0"
+o:depends({type = "v2ray", v2ray_protocol = "masque"})
+
+for _, field in ipairs({
+	{ "masque_warp_private_key", translate("WARP Device Private Key") },
+	{ "masque_warp_public_key", translate("WARP Endpoint Public Key") }
+}) do
+	o = s:option(TextValue, field[1], field[2])
+	o.rows = 3
+	o.wrap = "off"
+	o:depends({type = "v2ray", v2ray_protocol = "masque", masque_warp = "1"})
+	o.cfgvalue = function(self, section)
+		return (m:get(section, self.option) or ""):gsub("\\n", "\n")
+	end
+	o.validate = function(self, value)
+		return trim(value):gsub("\r\n?", "\n"):gsub("\n", "\\n")
+	end
+end
+
+o = s:option(DynamicList, "masque_warp_address", "WARP " .. translate("Local Address"))
+o:depends({type = "v2ray", v2ray_protocol = "masque", masque_warp = "1"})
+
+o = s:option(Value, "masque_path", translate("MASQUE Path"))
+o:depends({type = "v2ray", v2ray_protocol = "masque"})
+
+o = s:option(TextValue, "masque_headers", translate("Custom HTTP Headers"))
+o.rows = 5
+o.wrap = "off"
+o:depends({type = "v2ray", v2ray_protocol = "masque"})
+o.cfgvalue = function(self, section)
+	return (m:get(section, "masque_headers") or ""):gsub("\\n", "\n")
+end
+o.validate = function(self, value)
+	value = trim(value):gsub("\r\n", "\n"):gsub("\r", "\n")
+	local headers = {}
+	for line in value:gmatch("[^\n]+") do
+		if trim(line) ~= "" then
+			local key = line:match("^%s*([^:]+):")
+			key = key and trim(key):lower()
+			if not key or not key:match("^[!#$%%&'*+%.%^_`|~%w%-]+$") or headers[key] or key == "host" or key == "capsule-protocol" then
+				return nil, translate("Not true format, please re-enter!") .. " (" .. line .. ")"
+			end
+			headers[key] = true
+		end
+	end
+	return value:gsub("\n", "\\n")
+end
+
+o = s:option(Value, "snell_psk", translate("Snell PSK"))
+o.password = true
+o.rmempty = true
+o:depends({type = "v2ray", v2ray_protocol = "snell"})
 
 o = s:option(ListValue, "encrypt_method", translate("Encrypt Method"))
 for _, v in ipairs(encrypt_methods) do
@@ -261,9 +653,15 @@ o:depends("type", "ssr")
 
 o = s:option(ListValue, "encrypt_method_ss", translate("Encrypt Method"))
 for _, v in ipairs(encrypt_methods_ss) do
-	o:value(v)
+	if v == "none" then
+	   o.default = "none"
+	   o:value("none", translate("none"))
+	else
+	    o:value(v, translate(v))
+	end
 end
 o.rmempty = true
+o:depends("type", "ss-rust")
 o:depends("type", "ss")
 o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
 
@@ -278,24 +676,46 @@ o.rmempty = true
 o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
 o.default = "1"
 
+-- [[ Enable Shadowsocks Plugin ]]--
+o = s:option(Flag, "enable_plugin", translate("Enable Plugin"))
+o.rmempty = true
+o:depends("type", "ss")
+o:depends("type", "ss-rust")
+o.default = "0"
+
 -- Shadowsocks Plugin
-o = s:option(Value, "plugin", translate("Obfs"))
+o = s:option(ListValue, "plugin", translate("Obfs"))
 o:value("none", translate("None"))
-if is_finded("obfs-local") then
+if has_mihomo or is_finded("obfs-local") then
 	o:value("obfs-local", translate("obfs-local"))
 end
-if is_finded("v2ray-plugin") then
+if has_mihomo or is_finded("v2ray-plugin") then
 	o:value("v2ray-plugin", translate("v2ray-plugin"))
+end
+if has_mihomo then
+	o:value("gost-plugin", translate("gost-plugin"))
 end
 if is_finded("xray-plugin") then
 	o:value("xray-plugin", translate("xray-plugin"))
 end
+if has_mihomo or is_finded("shadow-tls") then
+	o:value("shadow-tls", translate("Shadow-TLS"))
+end
+if has_mihomo then
+	o:value("restls", translate("restls"))
+	o:value("kcptun", translate("kcptun"))
+end
+o:value("custom", translate("Custom"))
 o.rmempty = true
-o:depends("type", "ss")
+o:depends({enable_plugin = true})
+
+o = s:option(Value, "custom_plugin", translate("Custom Plugin Path"))
+o.placeholder = "/path/to/custom-plugin"
+o:depends({plugin = "custom"})
 
 o = s:option(Value, "plugin_opts", translate("Plugin Opts"))
 o.rmempty = true
-o:depends("type", "ss")
+o:depends({enable_plugin = true})
 
 o = s:option(ListValue, "protocol", translate("Protocol"))
 for _, v in ipairs(protocol) do
@@ -306,6 +726,7 @@ o:depends("type", "ssr")
 
 o = s:option(Value, "protocol_param", translate("Protocol param (optional)"))
 o:depends("type", "ssr")
+o:depends({type = "v2ray", v2ray_protocol = "shadowsocksr"})
 
 o = s:option(ListValue, "obfs", translate("Obfs"))
 for _, v in ipairs(obfs) do
@@ -316,103 +737,189 @@ o:depends("type", "ssr")
 
 o = s:option(Value, "obfs_param", translate("Obfs param (optional)"))
 o:depends("type", "ssr")
+o:depends({type = "v2ray", v2ray_protocol = "shadowsocksr"})
 
+-- Xray uses Mihomo's SSR registry, which differs from legacy libev.
+for _, field in ipairs({
+	{"ssr_method", "Encrypt Method", {"aes-128-cfb", "aes-192-cfb", "aes-256-cfb", "aes-128-ctr", "aes-192-ctr", "aes-256-ctr", "rc4-md5", "chacha20", "chacha20-ietf", "xchacha20", "none"}},
+	{"ssr_protocol", "Protocol", {"origin", "auth_sha1_v4", "auth_aes128_md5", "auth_aes128_sha1", "auth_chain_a", "auth_chain_b"}},
+	{"ssr_obfs", "Obfs", {"plain", "http_simple", "http_post", "random_head", "tls1.2_ticket_auth", "tls1.2_ticket_fastauth"}}
+}) do
+	o = s:option(ListValue, field[1], translate(field[2]))
+	for _, value in ipairs(field[3]) do o:value(value) end
+	o.default = field[3][1]
+	o.rmempty = false
+	o:depends({type = "v2ray", v2ray_protocol = "shadowsocksr"})
+end
 
 -- [[ Hysteria2 ]]--
+o = s:option(Flag, "hysteria2_realms", translate("Hysteria2 Realms"))
+o.default = "0"
+if xray_version_val > 260509 then
+	o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
+else
+	o:depends({type = "v2ray", v2ray_protocol = "__hide"})
+end
+
+o = s:option(Value, "hysteria2_realm_url", translate("Realm URL"), translate("Example:") .. "realm://public@realm.hy2.io/your-realm-name")
+o:depends("hysteria2_realms", true)
+o.validate = function(self, value)
+	value = trim(value)
+	local realm = parse_realm_uri(value)
+	if realm then return value end
+	return nil, translate("Invalid Realm URL.")
+end
+
+o = s:option(DynamicList, "hysteria2_realm_stun", translate("Realm STUN"))
+o.default = { "stun.sip.us:3478", "stun.nextcloud.com:3478", "global.stun.twilio.com:3478" }
+o:depends("hysteria2_realms", true)
+
+o = s:option(Flag, "hysteria2_realm_upnp", translate("Enable UPnP/NAT-PMP"), translate("Enable UPnP/NAT-PMP port mapping on your gateway to improve hole punching success."))
+o.default = "0"
+o:depends("hysteria2_realms", true)
+
 o = s:option(Value, "hy2_auth", translate("Users Authentication"))
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
+o.password = true
 o.rmempty = false
 
 o = s:option(Flag, "flag_port_hopping", translate("Enable Port Hopping"))
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", hysteria2_realms = false})
 o.rmempty = true
 o.default = "0"
 
-o = s:option(Value, "port_range", translate("Port Range"))
-o:depends({type = "hysteria", flag_port_hopping = true})
-o.datatype = "portrange"
+o = s:option(Value, "port_range", translate("Port hopping range"))
+o.description = translate("Format as 10000:20000 or 10000-20000 Multiple groups are separated by commas (,).")
+o:depends({type = "hysteria2", flag_port_hopping = true})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_port_hopping = true})
+o.datatype = "or(uinteger,portrange)"
 o.rmempty = true
 
 o = s:option(Flag, "flag_transport", translate("Enable Transport Protocol Settings"))
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
 o.rmempty = true
 o.default = "0"
 
 o = s:option(ListValue, "transport_protocol", translate("Transport Protocol"))
-o:depends({type = "hysteria", flag_transport = true})
+o:depends({type = "hysteria2", flag_transport = true})
 o:value("udp", translate("UDP"))
 o.default = "udp"
 o.rmempty = true
 
 o = s:option(Value, "hopinterval", translate("Port Hopping Interval(Unit:Second)"))
-o:depends({type = "hysteria", flag_transport = true, flag_port_hopping = true})
-o.datatype = "uinteger"
+o.description = translate("Supports a fixed value or a random range (e.g., 30, 5-30), minimum 5.")
+o:depends({type = "hysteria2", flag_transport = true, flag_port_hopping = true})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_port_hopping = true})
+o.datatype = "or(uinteger,portrange)"
 o.rmempty = true
 o.default = "30"
 
 o = s:option(Flag, "flag_obfs", translate("Enable Obfuscation"))
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
 o.rmempty = true
 o.default = "0"
 
 o = s:option(Flag, "lazy_mode", translate("Enable Lazy Mode"))
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
 o.rmempty = true
 o.default = "0"
 
-o = s:option(Value, "obfs_type", translate("Obfuscation Type"))
-o:depends({type = "hysteria", flag_obfs = "1"})
+o = s:option(ListValue, "obfs_type", translate("Obfuscation Type"))
+o:value("", translate("Disable"))
+o:value("salamander")
+o:value("gecko")
 o.rmempty = true
-o.default = "salamander"
+o:depends({type = "hysteria2", flag_obfs = true})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_obfs = true})
+
+o = s:option(Value, "obfs_MinPacketSize", translate("Gecko Packet Size (min)"))
+o.datatype = "uinteger"
+o.placeholder = "512"
+o.default = "512"
+o:depends({type = "hysteria2", flag_obfs = true, obfs_type = "gecko"})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_obfs = true, obfs_type = "gecko"})
+
+o = s:option(Value, "obfs_MaxPacketSize", translate("Gecko Packet Size (max)"))
+o.datatype = "uinteger"
+o.placeholder = "1200"
+o.default = "1200"
+o:depends({type = "hysteria2", flag_obfs = true, obfs_type = "gecko"})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_obfs = true, obfs_type = "gecko"})
 
 o = s:option(Value, "salamander", translate("Obfuscation Password"))
-o:depends({type = "hysteria", flag_obfs = "1"})
+o.password = true
 o.rmempty = true
-o.default = "cry_me_a_r1ver"
+o:depends({type = "hysteria2", flag_obfs = true})
+local obfs = s.fields["obfs_type"].keylist
+if obfs and type(obfs) == "table" and #obfs > 0 then
+	for _, v in ipairs(obfs) do
+		if v and v ~= "" then
+			o:depends({
+				type = "v2ray", 
+				v2ray_protocol = "hysteria2", 
+				obfs_type = v, 
+				flag_obfs = true
+			})
+		end
+	end
+end
 
 o = s:option(Flag, "flag_quicparam", translate("Hysterir QUIC parameters"))
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
 o.rmempty = true
 o.default = "0"
 
 o = s:option(Flag, "disablepathmtudiscovery", translate("Disable QUIC path MTU discovery"))
-o:depends({type = "hysteria",flag_quicparam = "1"})
+o:depends({type = "hysteria2",flag_quicparam = true})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_quicparam = true})
 o.rmempty = true
 o.default = false
 
 --[[Hysteria2 QUIC parameters setting]]
 o = s:option(Value, "initstreamreceivewindow", translate("QUIC initStreamReceiveWindow"))
-o:depends({type = "hysteria", flag_quicparam = "1"})
+o:depends({type = "hysteria2", flag_quicparam = true})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_quicparam = true})
 o.datatype = "uinteger"
 o.rmempty = true
 o.default = "8388608"
 
-o = s:option(Value, "maxstreamseceivewindow", translate("QUIC maxStreamReceiveWindow"))
-o:depends({type = "hysteria", flag_quicparam = "1"})
+o = s:option(Value, "maxstreamreceivewindow", translate("QUIC maxStreamReceiveWindow"))
+o:depends({type = "hysteria2", flag_quicparam = true})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_quicparam = true})
 o.datatype = "uinteger"
 o.rmempty = true
 o.default = "8388608"
 
 o = s:option(Value, "initconnreceivewindow", translate("QUIC initConnReceiveWindow"))
-o:depends({type = "hysteria", flag_quicparam = "1"})
+o:depends({type = "hysteria2", flag_quicparam = true})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_quicparam = true})
 o.datatype = "uinteger"
 o.rmempty = true
 o.default = "20971520"
 
 o = s:option(Value, "maxconnreceivewindow", translate("QUIC maxConnReceiveWindow"))
-o:depends({type = "hysteria", flag_quicparam = "1"})
+o:depends({type = "hysteria2", flag_quicparam = true})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_quicparam = true})
 o.datatype = "uinteger"
 o.rmempty = true
 o.default = "20971520"
 
 o = s:option(Value, "maxidletimeout", translate("QUIC maxIdleTimeout(Unit:second)"))
-o:depends({type = "hysteria", flag_quicparam = "1"})
+o:depends({type = "hysteria2", flag_quicparam = true})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_quicparam = true})
 o.rmempty = true
 o.datatype = "uinteger"
 o.default = "30"
 
 o = s:option(Value, "keepaliveperiod", translate("The keep-alive period.(Unit:second)"))
-o:depends({type = "hysteria", flag_quicparam = "1"})
+o.description = translate("Default value 0 indicatesno heartbeat.")
+o:depends({type = "hysteria2", flag_quicparam = true})
+o:depends({type = "v2ray", v2ray_protocol = "wireguard"})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", flag_quicparam = true})
 o.rmempty = true
 o.datatype = "uinteger"
 o.default = "10"
@@ -431,7 +938,7 @@ o:depends("type", "shadowtls")
 o.default = "1"
 o.rmempty = false
 
-o = s:option(Flag, "fastopen", translate("TCP Fast Open"))
+o = s:option(Flag, "fastopen", translate("TCP Fast Open"), translate("Enabling TCP Fast Open Requires Server Support."))
 o:depends("type", "shadowtls")
 o.default = "0"
 o.rmempty = false
@@ -451,15 +958,15 @@ o.default = ""
 o = s:option(ListValue, "chain_type", translate("Shadow-TLS ChainPoxy type"))
 o:depends("type", "shadowtls")
 if is_finded("sslocal") then
-	o:value("sslocal", translate("Shadowsocks-rust Version"))
+	o:value("sslocal", translate("ShadowSocks-rust Version"))
 end
-if is_finded("xray") or is_finded("v2ray") then
+if is_finded("xray") then
 	o:value("vmess", translate("Vmess Protocol"))
 end
 o.default = "sslocal"
 o.rmempty = false
 
-o = s:option(Value, "sslocal_password",translate("Shadowsocks password"))
+o = s:option(Value, "sslocal_password",translate("Shadowsocks Password"))
 o:depends({type = "shadowtls", chain_type = "sslocal"})
 o.rmempty = true
 
@@ -482,29 +989,46 @@ end
 o.rmempty = true
 o.default="auto"
 
+o = s:option(ListValue, "xray_tuic_version", "TUIC Version")
+o:value("5", "v5 (UUID / Password)")
+o:value("4", "v4 (Token)")
+o.default = "5"
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
+
+o = s:option(Value, "xray_tuic_token", "TUIC Token")
+o.password = true
+o:depends({type = "v2ray", v2ray_protocol = "tuic", xray_tuic_version = "4"})
+
+o = s:option(Value, "xray_tuic_ca", translate("Certificate File Path"))
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
+
 -- [[ TUIC ]]
 -- TuicNameId
 o = s:option(Value, "tuic_uuid", translate("TUIC User UUID"))
+o.password = true
 o.rmempty = true
 o.default = uuid
 o:depends("type", "tuic")
+o:depends({type = "v2ray", v2ray_protocol = "tuic", xray_tuic_version = "5"})
 
 --Tuic IP
 o = s:option(Value, "tuic_ip", translate("TUIC Server IP Address"))
 o.rmempty = true
-o.datatype = "ip4addr"
+o.datatype = "ipaddr"
 o.default = ""
 o:depends("type", "tuic")
 
 -- Tuic Password
 o = s:option(Value, "tuic_passwd", translate("TUIC User Password"))
+o.password = true
 o.rmempty = true
 o.default = ""
 o:depends("type", "tuic")
-
+o:depends({type = "v2ray", v2ray_protocol = "tuic", xray_tuic_version = "5"})
 
 o = s:option(ListValue, "udp_relay_mode", translate("UDP relay mode"))
 o:depends("type", "tuic")
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
 o:value("native", translate("native UDP characteristics"))
 o:value("quic", translate("lossless UDP relay using QUIC streams"))
 o.default = "native"
@@ -512,6 +1036,7 @@ o.rmempty = true
 
 o = s:option(ListValue, "congestion_control", translate("Congestion control algorithm"))
 o:depends("type", "tuic")
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
 o:value("bbr", translate("BBR"))
 o:value("cubic", translate("CUBIC"))
 o:value("new_reno", translate("New Reno"))
@@ -520,12 +1045,14 @@ o.rmempty = true
 
 o = s:option(Value, "heartbeat", translate("Heartbeat interval(second)"))
 o:depends("type", "tuic")
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
 o.datatype = "uinteger"
 o.default = "3"
 o.rmempty = true
 
 o = s:option(Value, "timeout", translate("Timeout for establishing a connection to server(second)"))
 o:depends("type", "tuic")
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
 o.datatype = "uinteger"
 o.default = "8"
 o.rmempty = true
@@ -561,11 +1088,13 @@ o.rmempty = true
 
 o = s:option(Flag, "zero_rtt_handshake", translate("Enable 0-RTT QUIC handshake"))
 o:depends("type", "tuic")
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
 o.default = "0"
 o.rmempty = true
 
 -- Tuic settings for the local inbound socks5 server
 o = s:option(Flag, "tuic_dual_stack", translate("Dual-stack Listening Socket"))
+o.description = translate("If this option is not set, the socket behavior is platform dependent.")
 o:depends("type", "tuic")
 o.default = "0"
 o.rmempty = true
@@ -579,12 +1108,13 @@ o.rmempty = true
 -- AlterId
 o = s:option(Value, "alter_id", translate("AlterId"))
 o.datatype = "port"
-o.default = 16
+o.default = 0
 o.rmempty = true
 o:depends({type = "v2ray", v2ray_protocol = "vmess"})
 
 -- VmessId
 o = s:option(Value, "vmess_id", translate("Vmess/VLESS ID (UUID)"))
+o.password = true
 o.rmempty = true
 o.default = uuid
 o:depends({type = "v2ray", v2ray_protocol = "vmess"})
@@ -594,7 +1124,12 @@ o:depends({type = "v2ray", v2ray_protocol = "vless"})
 o = s:option(Value, "vless_encryption", translate("VLESS Encryption"))
 o.rmempty = true
 o.default = "none"
+o.placeholder = "none"
 o:depends({type = "v2ray", v2ray_protocol = "vless"})
+o.validate = function(self, value)
+	value = value and value:match("^%s*(.-)%s*$") or value
+	return value ~= "" and value or "none"
+end
 
 -- 加密方式
 o = s:option(ListValue, "security", translate("Encrypt Method"))
@@ -613,11 +1148,42 @@ o.rmempty = true
 o.default = "5"
 o:depends({type = "v2ray", v2ray_protocol = "socks"})
 
+o = s:option(ListValue, "snell_version", translate("Snell Version"))
+o:value("1", "v1")
+o:value("2", "v2")
+o:value("3", "v3")
+o:value("4", "v4")
+o:value("5", "v5")
+o.default = "4"
+o.rmempty = true
+o:depends({type = "v2ray", v2ray_protocol = "snell"})
+
+o = s:option(ListValue, "snell_obfs", translate("Snell Obfs"))
+o:value("", translate("Disable"))
+o:value("http", "HTTP")
+o:value("tls", "TLS")
+o.default = ""
+o.rmempty = true
+o:depends({type = "v2ray", v2ray_protocol = "snell"})
+
+o = s:option(Value, "snell_obfs_host", translate("Snell Obfs Host"))
+o.rmempty = true
+o:depends({type = "v2ray", v2ray_protocol = "snell"})
+
+o = s:option(Flag, "snell_reuse", translate("Connection reuse"))
+o.default = "0"
+for _, version in ipairs({"4", "5"}) do
+	o:depends({type = "v2ray", v2ray_protocol = "snell", snell_version = version})
+end
+
 -- 传输协议
 o = s:option(ListValue, "transport", translate("Transport"))
-o:value("tcp", "TCP")
+o:value("raw", "RAW (TCP)")
 o:value("kcp", "mKCP")
+o:value("kcptun", "Kcptun (Xray)")
 o:value("ws", "WebSocket")
+o:value("httpupgrade", "HTTPUpgrade")
+o:value("xhttp", "XHTTP (SplitHTTP)")
 o:value("h2", "HTTP/2")
 o:value("quic", "QUIC")
 o:value("grpc", "gRPC")
@@ -629,12 +1195,55 @@ o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
 o:depends({type = "v2ray", v2ray_protocol = "socks"})
 o:depends({type = "v2ray", v2ray_protocol = "http"})
 
--- [[ TCP部分 ]]--
+-- Native Kcptun transport (separate from mKCP and the external Kcptun client).
+o = s:option(Value, "xray_kcptun_key", "Kcptun Key")
+o:depends("transport", "kcptun")
+o.password = true
+o.rmempty = false
+
+o = s:option(ListValue, "xray_kcptun_crypt", "Kcptun Encryption")
+o:depends("transport", "kcptun")
+for _, crypt in ipairs({"aes", "aes-128", "aes-192", "aes-128-gcm", "salsa20", "tea", "xor", "none", "null", "blowfish", "twofish", "cast5", "3des", "xtea"}) do o:value(crypt, crypt) end
+o.default = "aes"
+
+o = s:option(ListValue, "xray_kcptun_mode", "Kcptun Mode")
+o:depends("transport", "kcptun")
+for _, mode in ipairs({"normal", "fast", "fast2", "fast3", "manual"}) do o:value(mode, mode) end
+o.default = "fast"
+
+o = s:option(ListValue, "xray_kcptun_smuxver", "Kcptun smux Version")
+o:depends("transport", "kcptun")
+o:value("1", "v1")
+o:value("2", "v2")
+o.default = "1"
+
+o = s:option(Flag, "xray_kcptun_nocomp", translate("Disable Compression"))
+o:depends("transport", "kcptun")
+o.default = "0"
+
+o = s:option(Value, "xray_kcptun_conn", translate("Connections"))
+o:depends("transport", "kcptun")
+o.datatype = "range(1,256)"
+o.default = "1"
+
+o = s:option(TextValue, "xray_kcptun_options", "Kcptun Advanced Options (JSON)")
+o:depends("transport", "kcptun")
+o.rows = 4
+o.rmempty = true
+o.description = translate("Optional MTU, FEC, windows and expiry settings. Encryption, key, compression and smux version must match the server. This transports streams over UDP; native proxy UDP is separate.")
+function o.validate(self, value, section)
+    if not value or value:match("^%s*$") then return "" end
+    local ok, parsed = pcall(luci.jsonc.parse, value)
+    if ok and type(parsed) == "table" and value:match("^%s*{") then return value end
+    return nil, translate("Must be a JSON object")
+end
+
+-- [[ RAW部分 ]]--
 -- TCP伪装
 o = s:option(ListValue, "tcp_guise", translate("Camouflage Type"))
-o:depends("transport", "tcp")
+o:depends("transport", "raw")
 o:value("none", translate("None"))
-o:value("http", "HTTP")
+o:value("http", translate("HTTP"))
 o.rmempty = true
 
 -- HTTP域名
@@ -659,7 +1268,12 @@ o = s:option(Value, "ws_path", translate("WebSocket Path"))
 o:depends("transport", "ws")
 o.rmempty = true
 
-if is_finded("v2ray") then
+-- WS间隔
+o = s:option(Value, "ws_heartbeatPeriod", translate("HeartbeatPeriod(second)"))
+o.datatype = "integer"
+o:depends("transport", "ws")
+
+if is_finded("xray") then
 	-- WS前置数据
 	o = s:option(Value, "ws_ed", translate("Max Early Data"))
 	o:depends("ws_ed_enable", true)
@@ -672,6 +1286,93 @@ if is_finded("v2ray") then
 	o:depends("ws_ed_enable", true)
 	o:value("Sec-WebSocket-Protocol")
 	o.rmempty = true
+end
+
+-- [[ httpupgrade部分 ]]--
+
+-- httpupgrade域名
+o = s:option(Value, "httpupgrade_host", translate("Httpupgrade Host"))
+o:depends({transport = "httpupgrade", tls = false})
+o.rmempty = true
+
+-- httpupgrade路径
+o = s:option(Value, "httpupgrade_path", translate("Httpupgrade Path"))
+o:depends("transport", "httpupgrade")
+o.rmempty = true
+
+-- [[ XHTTP部分 ]]--
+
+-- XHTTP 模式
+o = s:option(ListValue, "xhttp_mode", translate("XHTTP Mode"))
+o:depends("transport", "xhttp")
+o.default = "auto"
+o:value("auto")
+o:value("packet-up")
+o:value("stream-up")
+o:value("stream-one")
+
+-- XHTTP 主机
+o = s:option(Value, "xhttp_host", translate("XHTTP Host"))
+o.datatype = "hostname"
+o:depends("transport", "xhttp")
+o.rmempty = true
+
+-- XHTTP 路径
+o = s:option(Value, "xhttp_path", translate("XHTTP Path"))
+o.placeholder = "/"
+o:depends("transport", "xhttp")
+o.rmempty = true
+
+-- XHTTP 附加项
+o = s:option(Flag, "enable_xhttp_extra", translate("XHTTP Extra"))
+o.description = translate("Enable this option to configure XHTTP Extra (JSON format).")
+o.rmempty = true
+o.default = "0"
+o:depends("transport", "xhttp")
+
+o = s:option(TextValue, "xhttp_extra", " ")
+o.description = translate(
+		"<font><b>" .. translate("Configure XHTTP Extra Settings (JSON format), see:") .. "</b></font>" ..
+		" <a href='https://xtls.github.io/config/transports/splithttp.html#extra' target='_blank'>" ..
+		"<font style='color:green'><b>" .. translate("Click to the page") .. "</b></font></a>")
+o:depends("enable_xhttp_extra", true)
+--o.rmempty = true
+o.rows = 10
+o.wrap = "off"
+o.cfgvalue = function(self, section, value)
+	local raw = m:get(section, "xhttp_extra")
+	if raw then
+		return base64Decode(raw)
+	end
+end
+o.write = function(self, section, value)
+	m:set(section, "xhttp_extra", base64Encode(value) or "")
+	local success, data = pcall(luci.jsonc.parse, value)
+	if success and data then
+		local address = (data.extra and data.extra.downloadSettings and data.extra.downloadSettings.address)
+					or (data.downloadSettings and data.downloadSettings.address)
+		if address and address ~= "" then
+			address = address:gsub("^%[", ""):gsub("%]$", "")
+			m:set(section, "download_address", address)
+		else
+			m:del(section, "download_address")
+		end
+	else
+        m:del(section, "download_address")
+	end
+end
+o.validate = function(self, value)
+	value = trim(value):gsub("\r\n", "\n"):gsub("^[ \t]*\n", ""):gsub("\n[ \t]*$", ""):gsub("\n[ \t]*\n", "\n")
+	local ok, data = pcall(luci.jsonc.parse, value)
+	if ok and data then
+		return value
+	else
+		return nil, "XHTTP Extra " .. translate("Must be JSON text!")
+	end
+end
+o.remove = function(self, section, value)
+	m:del(section, "xhttp_extra")
+	m:del(section, "download_address")
 end
 
 -- [[ H2部分 ]]--
@@ -768,58 +1469,57 @@ o:value("utp", translate("BitTorrent (uTP)"))
 o:value("wechat-video", translate("WechatVideo"))
 o:value("dtls", translate("DTLS 1.2"))
 o:value("wireguard", translate("WireGuard"))
+o:value("dns", translate("DNS"))
 o.rmempty = true
+
+o = s:option(Value, "kcp_domain", translate("Camouflage Domain"))
+o.description = translate("Use it together with the DNS disguised type. You can fill in any domain.")
+o:depends("kcp_guise", "dns")
 
 o = s:option(Value, "mtu", translate("MTU"))
 o.datatype = "uinteger"
 o:depends("transport", "kcp")
 o:depends({type = "v2ray", v2ray_protocol = "wireguard"})
--- o.default = 1350
-o.rmempty = true
-
-o = s:option(Value, "tti", translate("TTI"))
-o.datatype = "uinteger"
-o:depends("transport", "kcp")
-o.default = 50
+o.default = 1350
 o.rmempty = true
 
 o = s:option(Value, "uplink_capacity", translate("Uplink Capacity(Default:Mbps)"))
 o.datatype = "uinteger"
-o:depends("transport", "kcp")
-o:depends("type", "hysteria")
-o.default = 5
+o:depends("type", "hysteria2")
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
+o.placeholder = 5
 o.rmempty = true
 
 o = s:option(Value, "downlink_capacity", translate("Downlink Capacity(Default:Mbps)"))
 o.datatype = "uinteger"
-o:depends("transport", "kcp")
-o:depends("type", "hysteria")
-o.default = 20
-o.rmempty = true
-
-o = s:option(Value, "read_buffer_size", translate("Read Buffer Size"))
-o.datatype = "uinteger"
-o:depends("transport", "kcp")
-o.default = 2
-o.rmempty = true
-
-o = s:option(Value, "write_buffer_size", translate("Write Buffer Size"))
-o.datatype = "uinteger"
-o:depends("transport", "kcp")
-o.default = 2
+o:depends("type", "hysteria2")
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
+o.placeholder = 20
 o.rmempty = true
 
 o = s:option(Value, "seed", translate("Obfuscate password (optional)"))
 o:depends("transport", "kcp")
 o.rmempty = true
 
-o = s:option(Flag, "congestion", translate("Congestion"))
-o:depends("transport", "kcp")
+-- [[ WireGuard 部分 ]]--
+o = s:option(Flag, "kernelmode", translate("Enabled Kernel virtual NIC TUN(optional)"))
+o.description = translate(
+		"<ul>" ..
+		"<li>" .. translate("Linux kernel TUN virtual NIC requires system support and root privileges.") .. "</li>" ..
+		"<li>" .. translate("When enabled, it occupies IPv6 routing table 1023.") .. "</li>" ..
+		"</ul>"
+)
+o:depends({type = "v2ray", v2ray_protocol = "wireguard"})
+o.default = "0"
 o.rmempty = true
 
--- [[ WireGuard 部分 ]]--
 o = s:option(DynamicList, "local_addresses", translate("Local addresses"))
-o.datatype = "cidr"
+--o.datatype = "cidr"
+o:depends({type = "v2ray", v2ray_protocol = "wireguard"})
+o.rmempty = true
+
+o = s:option(DynamicList, "reserved", translate("Reserved bytes(optional)"))
+o.description = translate("Supports decimal numbers separated by \",\" or Base64-encoded strings, with a maximum length of 3 bytes.")
 o:depends({type = "v2ray", v2ray_protocol = "wireguard"})
 o.rmempty = true
 
@@ -837,6 +1537,110 @@ o:depends({type = "v2ray", v2ray_protocol = "wireguard"})
 o.password = true
 o.rmempty = true
 
+o = s:option(DynamicList, "allowedips", translate("allowedIPs(optional)"))
+o.description = translate("Wireguard allows only traffic from specific source IP.")
+o.datatype = "cidr"
+o:depends({type = "v2ray", v2ray_protocol = "wireguard"})
+o.default = "0.0.0.0/0"
+o.rmempty = true
+
+-- [[ User-Agent部分 ]]--
+o = s:option(Value, "user_agent", translate("User-Agent"))
+o.default = ""
+o:value("", translate("Default"))
+o:value("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36", translate("chrome"))
+o:value("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0", translate("firefox"))
+o:value("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15", translate("safari"))
+o:value("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.70", translate("edge"))
+o:value("Go-http-client/1.1", translate("golang"))
+o:value("curl/7.68.0", translate("curl"))
+o:depends("tcp_guise", "http")
+o:depends("transport", "ws")
+o:depends("transport", "httpupgrade")
+o:depends("transport", "xhttp")
+o:depends("transport", "grpc")
+o:depends("v2ray_protocol", "masque")
+
+--[[ FinalMask部分 ]]--
+o = s:option(Flag, "enable_finalmask", translate("FinalMask"))
+o.rmempty = true
+o.default = "0"
+local protocols = s.fields["v2ray_protocol"].keylist
+if protocols and type(protocols) == "table" and #protocols > 0 then
+	for _, proto in ipairs(protocols) do
+		if not proto:find("^_") then
+			if proto == "hysteria2" then
+				o:depends({type = "v2ray", v2ray_protocol = "hysteria2", hysteria2_realms = false})
+			elseif proto ~= "socks" and proto ~= "http" and proto ~= "shadowsocksr" and proto ~= "tuic" and proto ~= "snell" then
+				o:depends({type = "v2ray", v2ray_protocol = proto})
+			end
+		end
+	end
+end
+
+o = s:option(TextValue, "finalmask", " ")
+o.description = translate("An FinalMaskObject in JSON format, used for sharing.") .. "<br>" ..
+		translate("Custom finalmask overrides mkcp, hysteria2, fragment, noise, and related settings.")
+o:depends("enable_finalmask", true)
+o.rows = 10
+o.wrap = "off"
+o.custom_cfgvalue = function(self, section, value)
+	local raw = m:get(section, "finalmask")
+	if raw then
+		return base64Decode(raw)
+	end
+end
+o.custom_write = function(self, section, value)
+	m:set(section, "finalmask", base64Encode(value) or "")
+end
+o.validate = function(self, value)
+	value = trim(value):gsub("\r\n", "\n"):gsub("^[ \t]*\n", ""):gsub("\n[ \t]*$", ""):gsub("\n[ \t]*\n", "\n")
+	if luci.jsonc.parse(value) then
+		return value
+	else
+		return nil, "FinalMask " .. translate("Must be JSON text!")
+	end
+end
+
+-- ShadowTLS wraps the existing TCP proxy protocol in Xray.
+o = s:option(Flag, "xray_shadowtls", "ShadowTLS (Xray)")
+o.default = "0"
+for _, proto in ipairs({"vmess", "vless", "trojan", "shadowsocks"}) do
+    o:depends({type = "v2ray", v2ray_protocol = proto, transport = "raw", tls = false, reality = false})
+end
+o.description = translate("ShadowTLS protects TCP connections. The inner proxy protocol must provide encryption.")
+
+o = s:option(ListValue, "xray_shadowtls_version", "ShadowTLS Version")
+o:depends("xray_shadowtls", "1")
+o:value("3", "v3")
+o:value("2", "v2")
+o:value("1", "v1")
+o.default = "3"
+
+o = s:option(Value, "xray_shadowtls_password", "ShadowTLS Password")
+o:depends({xray_shadowtls = "1", xray_shadowtls_version = "2"})
+o:depends({xray_shadowtls = "1", xray_shadowtls_version = "3"})
+o.password = true
+o.rmempty = false
+
+o = s:option(Value, "xray_shadowtls_sni", "ShadowTLS SNI")
+o:depends("xray_shadowtls", "1")
+o.datatype = "hostname"
+o.rmempty = false
+
+o = s:option(ListValue, "xray_shadowtls_fingerprint", translate("TLS Client Fingerprint"))
+o:depends("xray_shadowtls", "1")
+for _, fp in ipairs({"chrome", "firefox", "safari", "ios", "android", "edge", "none"}) do o:value(fp, fp) end
+o.default = "chrome"
+
+o = s:option(Flag, "xray_shadowtls_strict", translate("TLS 1.3 Strict mode"))
+o:depends({xray_shadowtls = "1", xray_shadowtls_version = "3"})
+o.default = "1"
+
+o = s:option(Flag, "xray_shadowtls_insecure", translate("Allow Insecure"))
+o:depends("xray_shadowtls", "1")
+o.default = "0"
+
 -- [[ TLS ]]--
 o = s:option(Flag, "tls", translate("TLS"))
 o.rmempty = true
@@ -845,10 +1649,13 @@ o:depends({type = "v2ray", v2ray_protocol = "vless", reality = false})
 o:depends({type = "v2ray", v2ray_protocol = "vmess", reality = false})
 o:depends({type = "v2ray", v2ray_protocol = "trojan", reality = false})
 o:depends({type = "v2ray", v2ray_protocol = "shadowsocks", reality = false})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2", reality = false})
+o:depends({type = "v2ray", v2ray_protocol = "masque", reality = false})
+o:depends({type = "v2ray", v2ray_protocol = "anytls", reality = false})
 o:depends({type = "v2ray", v2ray_protocol = "socks", socks_ver = "5", reality = false})
 o:depends({type = "v2ray", v2ray_protocol = "http", reality = false})
 o:depends("type", "trojan")
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
 
 -- [[ TLS部分 ]] --
 o = s:option(Flag, "tls_sessionTicket", translate("Session Ticket"))
@@ -877,15 +1684,19 @@ if is_finded("xray") then
 	-- [[ XTLS ]]--
 	o = s:option(ListValue, "tls_flow", translate("Flow"))
 	for _, v in ipairs(tls_flows) do
-		o:value(v, translate(v))
+		if v == "none" then
+		   o.default = "none"
+		   o:value("none", translate("none"))
+		else
+		    o:value(v, translate(v))
+		end
 	end
 	o.rmempty = true
-	o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "tcp", tls = true})
-	o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "tcp", reality = true})
+	o:depends({type = "v2ray", v2ray_protocol = "vless"})
 
 	-- [[ uTLS ]]--
-	o = s:option(Value, "fingerprint", translate("Finger Print"))
-	o.default = "chrome"
+	o = s:option(ListValue, "fingerprint", translate("Finger Print"))
+	o.default = ""
 	o:value("chrome", translate("chrome"))
 	o:value("firefox", translate("firefox"))
 	o:value("safari", translate("safari"))
@@ -896,60 +1707,225 @@ if is_finded("xray") then
 	o:value("qq", translate("qq"))
 	o:value("random", translate("random"))
 	o:value("randomized", translate("randomized"))
+	o:value("unsafe", translate("unsafe"))
 	o:value("", translate("disable"))
-	o:depends({type = "v2ray", tls = true})
+	local protocols = s.fields["v2ray_protocol"].keylist
+	if protocols and type(protocols) == "table" and #protocols > 0 then
+		for _, proto in ipairs(protocols) do
+			if not proto:find("^_") then
+				if proto ~= "masque" then
+					o:depends({type = "v2ray", v2ray_protocol = proto, tls = true})
+					o:depends({type = "v2ray", v2ray_protocol = proto, reality = true})
+				end
+			end
+		end
+	end
+
+	o = s:option(Flag, "enable_ech", translate("Enable ECH(optional)"))
+	o.rmempty = true
+	o.default = "0"
+	local protocols = s.fields["v2ray_protocol"].keylist
+	if protocols and type(protocols) == "table" and #protocols > 0 then
+		for _, proto in ipairs(protocols) do
+			if not proto:find("^_") then
+				if proto == "hysteria2" then
+					o:depends({type = "v2ray", v2ray_protocol = "hysteria2", tls = true, hysteria2_realms = false})
+				else
+					o:depends({type = "v2ray", v2ray_protocol = proto, tls = true})
+				end
+			end
+		end
+	end
+
+	o = s:option(TextValue, "ech_config", translate("ECH Config"))
+	o.description = translate(
+    	"<font><b>" .. translate("If it is not empty, it indicates that the Client has enabled Encrypted Client, see:") .. "</b></font>" ..
+    	" <a href='https://xtls.github.io/config/transport.html#tlsobject' target='_blank'>" ..
+    	"<font style='color:green'><b>" .. translate("Click to the page") .. "</b></font></a>")
+	o:depends("enable_ech", true)
+	o.default = ""
+	o.rows = 5
+	o.wrap = "soft"
+	o.validate = function(self, value)
+    	-- 清理空行和多余换行
+    	return (value:gsub("[\r\n]", "")):gsub("^%s*(.-)%s*$", "%1")
+	end
+
+	o = s:option(ListValue, "ech_ForceQuery", translate("ECH Query Policy"))
+	o.description = translate("Controls the policy used when performing DNS queries for ECH configuration.")
+	o.default = "full"
+	o:value("none")
+	o:value("half")
+	o:value("full")
+	o:depends("enable_ech", true)
+
+	o = s:option(Flag, "enable_mldsa65verify", translate("Enable ML-DSA-65(optional)"))
+	o.rmempty = true
+	o.default = "0"
 	o:depends({type = "v2ray", reality = true})
+
+	o = s:option(TextValue, "reality_mldsa65verify", translate("ML-DSA-65 Public key"))
+	o.description = translate(
+    	"<font><b>" .. translate("The client has not configured mldsa65Verify, but it will not perform the \"additional verification\" step and can still connect normally, see:") .. "</b></font>" ..
+    	" <a href='https://github.com/XTLS/Xray-core/pull/4915' target='_blank'>" ..
+    	"<font style='color:green'><b>" .. translate("Click to the page") .. "</b></font></a>")
+	o:depends("enable_mldsa65verify", true)
+	o.default = ""
+	o.rows = 5
+	o.wrap = "soft"
+	o.validate = function(self, value)
+    	-- 清理空行和多余换行
+    	return (value:gsub("[\r\n]", "")):gsub("^%s*(.-)%s*$", "%1")
+	end
 end
 
 o = s:option(Value, "tls_host", translate("TLS Host"))
 o.datatype = "hostname"
 o:depends("tls", true)
+o:depends("xtls", true)
 o:depends("reality", true)
 o.rmempty = true
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
+o:depends({type = "v2ray", v2ray_protocol = "naive"})
 
-o = s:option(DynamicList, "tls_alpn", translate("TLS ALPN"))
-o:depends({type = "tuic", tls = true})
-o.rmempty = true
+-- TLS ALPN
+
+o = s:option(ListValue, "tls_alpn", translate("TLS ALPN"))
+o.default = ""
+o:value("", translate("Default"))
+o:value("h3")
+o:value("h2")
+o:value("h3,h2")
+o:value("http/1.1")
+o:value("h2,http/1.1")
+o:value("h3,h2,http/1.1")
+o:depends("type", "trojan")
+o:depends("type", "hysteria2")
+o:depends("tls", true)
+
+-- TUIC ALPN
+o = s:option(ListValue, "tuic_alpn", translate("TUIC ALPN"))
+o.default = ""
+o:value("", translate("Default"))
+o:value("h3")
+o:value("h2")
+o:value("h3,h2")
+o:value("http/1.1")
+o:value("h2,http/1.1")
+o:value("h3,h2,http/1.1")
+o:value("spdy/3.1")
+o:value("h3,spdy/3.1")
+o:depends("type", "tuic")
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
+
+-- IP STACK PREFERENCE
+o = s:option(ListValue, "ipstack_prefer", translate("IP Stack Preference"))
+o.default = ""
+o:value("", translate("Default"))
+o:value("v4first")
+o:value("v6first")
+o:depends("tuic_dual_stack", true)
 
 -- [[ allowInsecure ]]--
 o = s:option(Flag, "insecure", translate("allowInsecure"))
 o.rmempty = false
-o:depends("tls", true)
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
+o:depends("type", "trojan")
+o:depends("type", "tuic")
 o.description = translate("If true, allowss insecure connection at TLS client, e.g., TLS server uses unverifiable certificates.")
+o:depends("tls", true)
+o:depends({type = "v2ray", v2ray_protocol = "tuic"})
+
+if xray_version_val >= 260131 then
+	-- Xray 版本大于等于 26.1.31
+	-- [[ Xray TLS pinSHA256 ]] --
+	o = s:option(Value, "tls_CertSha", translate("TLS Chain Fingerprint (SHA256)"))
+	o.rmempty = true
+	o:depends({type = "v2ray", tls = true})
+	o.description = translate("Once set, connects only when the server’s chain fingerprint matches.") ..
+			string.format("<a href='javascript:void(0)' onclick='javascript:fetchCertSha256(this)'>%s</a>", "→ " .. translate("Fetch Manually"))
+
+	-- [[ Xray TLS verify leaf certificate name ]] --
+	o = s:option(Value, "tls_CertByName", translate("TLS Certificate Name (CertName)"))
+	o.rmempty = true
+	o:depends({type = "v2ray", tls = true})
+	o.description = translate("TLS is used to verify the leaf certificate name.") ..
+			string.format("<a href='javascript:void(0)' onclick='javascript:fetchCertByName(this)'>%s</a>", "→ " .. translate("Fetch Manually"))
+end
+
+o = s:option(Flag, "masque_certificate", translate("TLS Certificate (PEM)"))
+o.default = "0"
+o:depends({type = "v2ray", v2ray_protocol = "masque", tls = true})
+
+o = s:option(TextValue, "masque_certificate_pem", " ", translate("Full certificate (chain), PEM format."))
+o.default = ""
+o.rows = 5
+o.wrap = "off"
+o:depends("masque_certificate", 1)
+o.cfgvalue = function(self, section)
+	return (m:get(section, "masque_certificate_pem") or ""):gsub("\\n", "\n")
+end
+o.validate = function(self, value)
+	value = trim(value):gsub("\r\n", "\n"):gsub("\r", "\n"):gsub("[ \t]*\n[ \t]*", "\n"):gsub("\n+", "\n")
+	return value:gsub("\n", "\\n")
+end
 
 -- [[ Hysteria2 TLS pinSHA256 ]] --
 o = s:option(Value, "pinsha256", translate("Certificate fingerprint"))
-o:depends({type = "hysteria", insecure = true })
+o:depends("type", "hysteria2")
 o.rmempty = true
 
-
--- [[ Mux ]]--
-o = s:option(Flag, "mux", translate("Mux"))
+-- [[ Mux.Cool ]] --
+o = s:option(Flag, "mux", translate("Mux"), translate("Enable Mux.Cool"))
 o.rmempty = false
 o.default = false
-o:depends({type = "v2ray", v2ray_protocol = "vless"})
+o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "raw"})
+o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "ws"})
+o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "kcp"})
+o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "httpupgrade"})
+o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "h2"})
+o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "quic"})
+o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "grpc"})
 o:depends({type = "v2ray", v2ray_protocol = "vmess"})
 o:depends({type = "v2ray", v2ray_protocol = "trojan"})
 o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
 o:depends({type = "v2ray", v2ray_protocol = "socks"})
 o:depends({type = "v2ray", v2ray_protocol = "http"})
 
-o = s:option(ListValue, "concurrency", translate("concurrency"))
+-- [[ TCP 最大并发连接数 ]]--
+o = s:option(Value, "concurrency", translate("concurrency"))
+o.description = translate(
+		"<ul>"
+		.. "<li>" .. translate("Default: disable. When entering a negative number, such as -1, The Mux module will not be used to carry TCP traffic.") .. "</li>"
+		.. "<li>" .. translate("Min value is 1, Max value is 128. When omitted or set to 0, it equals 8.") .. "</li>"
+		.. "</ul>")
 o.rmempty = true
 o.default = "-1"
 o:value("-1", translate("disable"))
 o:value("8", translate("8"))
 o:depends("mux", true)
 
-o = s:option(ListValue, "xudpConcurrency", translate("xudpConcurrency"))
+-- [[ UDP 最大并发连接数 ]]--
+o = s:option(Value, "xudpConcurrency", translate("xudpConcurrency"))
+o.description = translate(
+		"<ul>"
+		.. "<li>" .. translate("Default:16. When entering a negative number, such as -1, The Mux module will not be used to carry UDP traffic, Use original UDP transmission method of proxy protocol.") .. "</li>"
+		.. "<li>" .. translate("Min value is 1, Max value is 1024. When omitted or set to 0, Will same path as TCP traffic.") .. "</li>"
+		.. "</ul>")
 o.rmempty = true
 o.default = "16"
-o:value("16", translate("16"))
 o:value("-1", translate("disable"))
+o:value("16", translate("16"))
 o:depends("mux", true)
 
+-- [[ 对被代理的 UDP/443 流量处理方式 ]]--
 o = s:option(ListValue, "xudpProxyUDP443", translate("xudpProxyUDP443"))
+o.description = translate(
+		"<ul>"
+		.. "<li>" .. translate("Default reject rejects traffic.") .. "</li>"
+		.. "<li>" .. translate("allow: Allows use Mux connection.") .. "</li>"
+		.. "<li>" .. translate("skip: Not use Mux module to carry UDP 443 traffic, Use original UDP transmission method of proxy protocol.") .. "</li>"
+		.. "</ul>")
 o.rmempty = true
 o.default = "reject"
 o:value("reject", translate("reject"))
@@ -957,17 +1933,29 @@ o:value("allow", translate("allow"))
 o:value("skip", translate("skip"))
 o:depends("mux", true)
 
+-- [[ XHTTP TCP Fast Open ]]--
+--o = s:option(Flag, "tcpfastopen", translate("TCP Fast Open"), translate("Enabling TCP Fast Open Requires Server Support."))
+--o.rmempty = true
+--o.default = "0"
+--o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "xhttp"})
 
 -- [[ MPTCP ]]--
-o = s:option(Flag, "mptcp", translate("MPTCP"))
-o.rmempty = false
-o.default = false
+o = s:option(Flag, "mptcp", translate("MPTCP"), translate("Enable Multipath TCP, need to be enabled in both server and client configuration."))
+o.rmempty = true
+o.default = "0"
 o:depends({type = "v2ray", v2ray_protocol = "vless"})
 o:depends({type = "v2ray", v2ray_protocol = "vmess"})
 o:depends({type = "v2ray", v2ray_protocol = "trojan"})
 o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
 o:depends({type = "v2ray", v2ray_protocol = "socks"})
 o:depends({type = "v2ray", v2ray_protocol = "http"})
+o:depends({type = "v2ray", v2ray_protocol = "masque"})
+
+-- [[ TESTPRE ]]--
+o = s:option(Value, "preconns", translate("Pre-connections"), translate("Number of early established connections to reduce latency."))
+o.datatype = "uinteger"
+o.placeholder = 0
+o:depends({type = "v2ray", v2ray_protocol = "vless"})
 
 -- [[ custom_tcpcongestion 连接服务器节点的 TCP 拥塞控制算法 ]]--
 o = s:option(ListValue, "custom_tcpcongestion", translate("custom_tcpcongestion"))
@@ -975,6 +1963,7 @@ o.rmempty = true
 o.default = ""
 o:value("", translate("comment_tcpcongestion_disable"))
 o:value("bbr", translate("BBR"))
+o:value("brutal", translate("BRUTAL"))
 o:value("cubic", translate("CUBIC"))
 o:value("reno", translate("Reno"))
 o:depends({type = "v2ray", v2ray_protocol = "vless"})
@@ -984,143 +1973,24 @@ o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
 o:depends({type = "v2ray", v2ray_protocol = "socks"})
 o:depends({type = "v2ray", v2ray_protocol = "http"})
 
-
--- [[ custom_sniffing 流量嗅探 ]]--
-o = s:option(Flag, "custom_sniffing", translate("custom_sniffing"))
-o.rmempty = false
-o.default = true
-o:depends({type = "v2ray", v2ray_protocol = "vless"})
-o:depends({type = "v2ray", v2ray_protocol = "vmess"})
-o:depends({type = "v2ray", v2ray_protocol = "trojan"})
-o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
-o:depends({type = "v2ray", v2ray_protocol = "socks"})
-o:depends({type = "v2ray", v2ray_protocol = "http"})
-
--- [[ custom_domainsExcluded 流量嗅探域名排除列表 ]]--
-o = s:option(Flag, "custom_domainsExcluded", translate("custom_domainsExcluded"))
-o.rmempty = false
-o.default = true
-o:depends("custom_sniffing", true)
-
--- [[ custom_routeOnly 嗅探得到的域名仅用于 Xray 路由 ]]--
-o = s:option(Flag, "custom_routeOnly", translate("custom_routeOnly"))
-o.rmempty = false
-o.default = false
-o:depends("custom_sniffing", true)
-
-
--- [[ custom_dns_enable Xray DNS 功能 ]]--
-o = s:option(Flag, "custom_dns_enable", translate("custom_dns_enable"))
-o.rmempty = false
-o.default = false
-o:depends({type = "v2ray", v2ray_protocol = "vless"})
-o:depends({type = "v2ray", v2ray_protocol = "vmess"})
-o:depends({type = "v2ray", v2ray_protocol = "trojan"})
-o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
-o:depends({type = "v2ray", v2ray_protocol = "socks"})
-o:depends({type = "v2ray", v2ray_protocol = "http"})
-o.description = translate("comment_dns_inbound_enable")
-
--- [[ custom_dns_local 本地 DNS ]]--
-o = s:option(ListValue, "custom_dns_local", translate("custom_dns_local"))
+-- [[ HYSTERIA2_tcpcongestion 连接服务器节点的 TCP 拥塞控制算法 ]]--
+o = s:option(ListValue, "hy2_tcpcongestion", translate("custom_tcpcongestion"))
 o.rmempty = true
-o.default = "https+local://223.5.5.5/dns-query"
-o:value("https+local://223.5.5.5/dns-query", translate("https+local://223.5.5.5/dns-query"))
-o:value("https+local://119.29.29.29/dns-query", translate("https+local://119.29.29.29/dns-query"))
-o:depends("custom_dns_enable", true)
-
--- [[ custom_dns_remote 远端 DNS ]]--
-o = s:option(ListValue, "custom_dns_remote", translate("custom_dns_remote"))
-o.rmempty = true
-o.default = "https://1.1.1.1/dns-query"
-o:value("https://1.1.1.1/dns-query", translate("https://1.1.1.1/dns-query"))
-o:value("https://8.8.8.8/dns-query", translate("https://8.8.8.8/dns-query"))
-o:depends("custom_dns_enable", true)
-
--- [[ custom_dns_remote_domains 远端 DNS 域名列表 ]]--
-o = s:option(ListValue, "custom_dns_remote_domains", translate("custom_dns_remote_domains"))
-o.rmempty = true
-o.default = "geosite:geolocation-!cn"
-o:value("geosite:geolocation-!cn", translate("geosite:geolocation-!cn"))
-o:depends("custom_dns_enable", true)
-
--- [[ custom_nonIPQuery 非 A 和 AAAA 记录处理方式 ]]--
-o = s:option(ListValue, "custom_nonIPQuery", translate("custom_nonIPQuery"))
-o.rmempty = true
-o.default = "skip"
-o:value("skip", translate("skip"))
-o:value("drop", translate("drop"))
-o:depends("custom_dns_enable", true)
-
--- [[ custom_nonIPQuery_outbound_tag 非 A 和 AAAA 记录查询方式 ]]--
-o = s:option(ListValue, "custom_nonIPQuery_outbound_tag", translate("custom_nonIPQuery_outbound_tag"))
-o.rmempty = true
-o.default = "direct"
-o:value("direct", translate("direct"))
-o:value("proxy", translate("proxy"))
-o:depends({custom_nonIPQuery = "skip"})
-
--- [[ custom_dokodemo_door_dns_address 查询非 A 和 AAAA 记录 DNS ]]--
-o = s:option(ListValue, "custom_dokodemo_door_dns_address", translate("custom_dokodemo_door_dns_address"))
-o.rmempty = true
-o.default = "223.5.5.5"
-o:value("223.5.5.5", translate("223.5.5.5"))
-o:value("119.29.29.29", translate("119.29.29.29"))
-o:value("1.1.1.1", translate("1.1.1.1"))
-o:value("8.8.8.8", translate("8.8.8.8"))
-o:depends({custom_nonIPQuery = "skip"})
-
-
--- [[ custom_log Xray 日志功能 ]]--
-o = s:option(Flag, "custom_log", translate("custom_log"))
-o.rmempty = false
-o.default = false
-o:depends({type = "v2ray", v2ray_protocol = "vless"})
-o:depends({type = "v2ray", v2ray_protocol = "vmess"})
-o:depends({type = "v2ray", v2ray_protocol = "trojan"})
-o:depends({type = "v2ray", v2ray_protocol = "shadowsocks"})
-o:depends({type = "v2ray", v2ray_protocol = "socks"})
-o:depends({type = "v2ray", v2ray_protocol = "http"})
-
--- [[ custom_loglevel 日志级别 ]]--
-o = s:option(ListValue, "custom_loglevel", translate("custom_loglevel"))
-o.rmempty = true
-o.default = "warning"
-o:value("error", translate("error"))
-o:value("warning", translate("warning"))
-o:value("info", translate("info"))
-o:value("debug", translate("debug"))
-o:depends("custom_log", true)
-
--- [[ custom_dnsLog DNS 查询记录 ]]--
-o = s:option(Flag, "custom_dnsLog", translate("custom_dnsLog"))
-o.rmempty = true
-o.default = true
-o:depends("custom_log", true)
-
--- [[ custom_access 访问记录 ]]--
-o = s:option(ListValue, "custom_access", translate("custom_access"))
-o.rmempty = true
-o.default = "/tmp/access.log"
-o:value("/tmp/access.log", translate("/tmp/access.log"))
-o:value("none", translate("none"))
-o:depends("custom_log", true)
-
--- [[ custom_error 错误记录 ]]--
-o = s:option(ListValue, "custom_error", translate("custom_error"))
-o.rmempty = true
-o.default = "/tmp/error.log"
-o:value("/tmp/error.log", translate("/tmp/error.log"))
-o:value("none", translate("none"))
-o:depends("custom_log", true)
-
+o.default = ""
+o:value("", translate("comment_tcpcongestion_disable"))
+o:value("bbr", translate("BBR"))
+o:value("brutal", translate("BRUTAL"))
+o:value("force-brutal", translate("FORCE BRUTAL"))
+o:value("reno", translate("Reno"))
+o:value("cubic", translate("CUBIC"))
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
 
 -- [[ Cert ]]--
 o = s:option(Flag, "certificate", translate("Self-signed Certificate"))
 o.rmempty = true
 o.default = "0"
 o:depends("type", "tuic")
-o:depends({type = "hysteria", insecure = false})
+o:depends({type = "hysteria2", insecure = false})
 o:depends({type = "trojan", tls = true, insecure = false})
 o:depends({type = "v2ray", v2ray_protocol = "vmess", tls = true, insecure = false})
 o:depends({type = "v2ray", v2ray_protocol = "vless", tls = true, insecure = false})
@@ -1162,49 +2032,72 @@ end
 
 o = s:option(Value, "certpath", translate("Current Certificate Path"))
 o:depends("certificate", 1)
-o:value("/etc/ssl/private/ca.pem")
+o:value("/etc/ssl/private/ca.crt")
 o.description = translate("Please confirm the current certificate path")
-o.default = "/etc/ssl/private/ca.pem"
+o.default = "/etc/ssl/private/ca.crt"
 
-o = s:option(Flag, "fast_open", translate("TCP Fast Open"))
+o = s:option(Flag, "fast_open", translate("TCP Fast Open"), translate("Enabling TCP Fast Open Requires Server Support."))
 o.rmempty = true
 o.default = "0"
 o:depends("type", "ssr")
 o:depends("type", "ss")
+o:depends("type", "ss-rust")
 o:depends("type", "trojan")
-o:depends("type", "hysteria")
+o:depends("type", "hysteria2")
+o:depends({type = "v2ray", v2ray_protocol = "vless", transport = "xhttp"})
+o:depends({type = "v2ray", v2ray_protocol = "masque"})
+o:depends({type = "v2ray", v2ray_protocol = "hysteria2"})
 
 o = s:option(Flag, "switch_enable", translate("Enable Auto Switch"))
 o.rmempty = false
 o.default = "1"
-
-o = s:option(Value, "local_port", translate("Local Port"))
-o.datatype = "port"
-o.default = 1234
-o.rmempty = false
 
 if is_finded("kcptun-client") then
 	o = s:option(Flag, "kcp_enable", translate("KcpTun Enable"))
 	o.rmempty = true
 	o.default = "0"
 	o:depends("type", "ssr")
+	o:depends("type", "ss-rust")
 	o:depends("type", "ss")
 
 	o = s:option(Value, "kcp_port", translate("KcpTun Port"))
 	o.datatype = "portrange"
 	o.default = 4000
 	o:depends("type", "ssr")
+	o:depends("type", "ss-rust")
 	o:depends("type", "ss")
 
 	o = s:option(Value, "kcp_password", translate("KcpTun Password"))
 	o.password = true
 	o:depends("type", "ssr")
+	o:depends("type", "ss-rust")
 	o:depends("type", "ss")
 
 	o = s:option(Value, "kcp_param", translate("KcpTun Param"))
 	o.default = "--nocomp"
 	o:depends("type", "ssr")
+	o:depends("type", "ss-rust")
 	o:depends("type", "ss")
+end
+
+
+-- Naive uses Cronet TLS and multiplexing, independently of Xray stream TLS.
+for _, field in ipairs({
+    {"naive_quic", "Naive HTTP/3 (QUIC)"},
+    {"naive_udp_over_tcp", "Naive UDP over TCP (server support required)"}
+}) do
+    o = s:option(Flag, field[1], translate(field[2]))
+    o.default = "0"
+    o:depends({type = "v2ray", v2ray_protocol = "naive"})
+end
+
+for _, field in ipairs({
+    {"naive_certificate_file", "Naive trusted CA certificate file"},
+    {"naive_ech_config", "Naive ECH config list (base64)"}
+}) do
+    o = s:option(Value, field[1], translate(field[2]))
+    o.rmempty = true
+    o:depends({type = "v2ray", v2ray_protocol = "naive"})
 end
 
 return m
